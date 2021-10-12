@@ -1,0 +1,23 @@
+[package]
+name = "ebnf"
+version = "1.0.0"
+authors = ["Torao Takami <koiroha@gmail.com>"]
+edition = "2018"
+repository = "https://github.com/torao/ebnf"
+keywords = ["iso-14977", "bnf", "ebnf", "lexer"]
+license = "MIT"
+readme = "README.md"
+description = "A Lexical Analyzer for Extended BNF"
+documentation = "https://docs.rs/ebnf"
+
+[badges]
+# circle-ci = { repository = "torao/ebnf", branch = "master" }
+maintenance = { status = "passively-maintained" }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+encoding_rs = "0.8"
+
+[dev-dependencies]
+regex = "1"
