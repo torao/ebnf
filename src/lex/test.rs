@@ -1,10 +1,16 @@
-use std::{fs::{File, remove_file}, io::Cursor};
+use std::{
+  fs::{remove_file, File},
+  io::Cursor,
+};
 
 use regex::Regex;
 use std::io::Write;
 
-use crate::{Location, lex::{self, parse, parse_file, parse_str}};
-use crate::io::test::ErrorRead;
+use crate::{io::test::ErrorRead, test::split_by};
+use crate::{
+  lex::{self, parse, parse_file, parse_str},
+  Location,
+};
 
 use super::Lexer;
 
@@ -32,10 +38,16 @@ macro_rules! def {
 
 macro_rules! term {
   ($factor:expr) => {
-    lex::SyntacticTerm { syntactic_factor: $factor, syntactic_exception: None }
+    lex::SyntacticTerm {
+      syntactic_factor: $factor,
+      syntactic_exception: None,
+    }
   };
   ($factor:expr, $exception:expr) => {
-    lex::SyntacticTerm { syntactic_factor: $factor, syntactic_exception: Some($exception) }
+    lex::SyntacticTerm {
+      syntactic_factor: $factor,
+      syntactic_exception: Some($exception),
+    }
   };
 }
 
@@ -44,7 +56,10 @@ macro_rules! factor {
     factor!($primary, 1)
   };
   ($primary:expr, $repetition:expr) => {
-    lex::SyntacticFactor { repetition: $repetition, syntactic_primary: $primary }
+    lex::SyntacticFactor {
+      repetition: $repetition,
+      syntactic_primary: $primary,
+    }
   };
 }
 
@@ -140,28 +155,29 @@ fn syntax_restored_from_file() {
 
 #[test]
 fn syntax_doesnt_ends_with_terminator() {
-  assert_correct_syntax_rules("a = 'A'", vec![
-    rule!(id!(1, 1, "a"), def!(term!(terminal!(1, 5, "A"))))
-  ]);
-  assert_correct_syntax_rules("a = 'A'; b = 'B'", vec![
-    rule!(id!(1, 1, "a"), def!(term!(terminal!(1, 5, "A")))),
-    rule!(id!(1, 9, "b"), def!(term!(terminal!(1, 14, "B")))),
-  ]);
-
-  assert_eq!(
-    parse_str("", "a = 'A';").unwrap(),
-    parse_str("", "a = 'A'").unwrap(),
+  assert_correct_syntax_rules(
+    "a = 'A'",
+    vec![rule!(id!(1, 1, "a"), def!(term!(terminal!(1, 5, "A"))))],
   );
+  assert_correct_syntax_rules(
+    "a = 'A'; b = 'B'",
+    vec![
+      rule!(id!(1, 1, "a"), def!(term!(terminal!(1, 5, "A")))),
+      rule!(id!(1, 9, "b"), def!(term!(terminal!(1, 14, "B")))),
+    ],
+  );
+
+  assert_eq!(parse_str("", "a = 'A';").unwrap(), parse_str("", "a = 'A'").unwrap(),);
   assert_eq!(
     parse_str("", "a = 'A';").unwrap(),
-    parse(&mut Cursor::new(b"a = 'A'"), "", "utf-8", 1024).unwrap(),
+    parse("", &mut Cursor::new(b"a = 'A'"), "utf-8", 1024).unwrap(),
   );
 }
 
 #[test]
 fn syntax_io_error_in_reading() {
   let mut r = ErrorRead::new(b"a = '", "something's wrong");
-  let err = parse(&mut r, "path", "us-ascii", 1024).unwrap_err();
+  let err = parse("path", &mut r, "us-ascii", 1024).unwrap_err();
   assert_eq!(Location::with_location("path", 1, 5), err.location);
   assert!(err.message.contains("something's wrong"));
 }
@@ -201,7 +217,13 @@ fn single_rule_placed_on_multiple_lines() {
       id!(2, 3, "multi line syntax rule"),
       def!(
         term!(repeat!(4, 5, 1, def!(term!(id!(4, 7, "abc")))), id!(4, 15, "xyz")),
-        term!(option!(5, 5, 1, def!(term!(id!(5, 7, "xyz"))), def!(term!(id!(5, 13, "abc"))))),
+        term!(option!(
+          5,
+          5,
+          1,
+          def!(term!(id!(5, 7, "xyz"))),
+          def!(term!(id!(5, 13, "abc")))
+        )),
         term!(grouped!(
           6,
           11,
@@ -235,9 +257,7 @@ fn meta_identifier() {
     &format!("{} = 'x';", valid),
     rule!(id!(1, 1, &valid), def!(term!(terminal!(1, valid.len() + 4, "x")))),
   );
-  for invalid in ('\u{00}'..'\u{FF}')
-    .filter(|ch| !valid.contains(*ch) && !"\'\"= \t\r\n\u{b}\u{c}".contains(*ch))
-  {
+  for invalid in ('\u{00}'..'\u{FF}').filter(|ch| !valid.contains(*ch) && !"\'\"= \t\r\n\u{b}\u{c}".contains(*ch)) {
     assert_incorrect_syntax_rules(&format!("a{}z = 'x';", invalid), 1, 2, ".*");
   }
 
@@ -358,6 +378,23 @@ fn repetition_symbol() {
 
 #[test]
 fn except_symbol() {
+  assert_correct_syntax_rule(
+    "a = ('a' | 'b') - 'b';",
+    rule!(
+      id!(1, 1, "a"),
+      def!(term!(
+        grouped!(
+          1,
+          5,
+          1,
+          def!(term!(terminal!(1, 6, "a"))),
+          def!(term!(terminal!(1, 12, "b")))
+        ),
+        terminal!(1, 19, "b")
+      ))
+    ),
+  );
+
   // Representation with exceptions.
   assert_correct_syntax_rule(
     "ac = abc - 'b' | axc - 'x';",
@@ -386,21 +423,30 @@ fn concatenate_symbol() {
     "abc = 'a', 'b', 'c';",
     rule!(
       id!(1, 1, "abc"),
-      def!(term!(terminal!(1, 7, "a")), term!(terminal!(1, 12, "b")), term!(terminal!(1, 17, "c")))
+      def!(
+        term!(terminal!(1, 7, "a")),
+        term!(terminal!(1, 12, "b")),
+        term!(terminal!(1, 17, "c"))
+      )
     ),
   );
 
   // A sequence of concatenate-symbols is implicitly considered to have an empty-sequence.
   assert_correct_syntax_rule(
     "xxx = , , ;",
-    rule!(id!(1, 1, "xxx"), def!(term!(empty!(1, 7)), term!(empty!(1, 9)), term!(empty!(1, 11)))),
+    rule!(
+      id!(1, 1, "xxx"),
+      def!(term!(empty!(1, 7)), term!(empty!(1, 9)), term!(empty!(1, 11)))
+    ),
   );
 }
 
 #[test]
 fn comment() {
   // Printable characters can be used.
-  let valid = ('\u{20}'..'\u{7F}').chain("\t\r\n\u{b}\u{c}".chars()).collect::<String>();
+  let valid = ('\u{20}'..'\u{7F}')
+    .chain("\t\r\n\u{b}\u{c}".chars())
+    .collect::<String>();
   assert_correct_syntax_rule(
     &format!("abc = 'a' (*{}*);", valid),
     rule!(id!(1, 1, "abc"), def!(term!(terminal!(1, 7, "a")))),
@@ -411,8 +457,8 @@ fn comment() {
     assert_incorrect_syntax_rules(
       &format!("abc = 'a' (*{}*);", invalid),
       1,
-      11,
-      "The comment contains a character '.+' that cannot be used\\.",
+      13,
+      "This comment contains a character '.+' \\(U\\+[0-9a-fA-F]{4}\\) that cannot be used as a comment\\.",
     );
   }
 }
@@ -432,9 +478,7 @@ fn special_sequence() {
   );
 
   // Control-codes other than gap-symbol and 8-bit characters cannot be used.
-  for invalid in
-    ('\u{0}'..='\u{FF}').filter(|ch| !valid.contains(*ch) && !"?\t\r\n\u{b}\u{c}".contains(*ch))
-  {
+  for invalid in ('\u{0}'..='\u{FF}').filter(|ch| !valid.contains(*ch) && !"?\t\r\n\u{b}\u{c}".contains(*ch)) {
     assert_incorrect_syntax_rules(
       &format!("abc = ?{}?;", invalid),
       1,
@@ -530,7 +574,10 @@ fn syntactic_term() {
   ] {
     assert_correct_syntax_rule(
       &format!("abc = {} * {} - 'x';", REPEAT, syntax),
-      rule!(id!(1, 1, "abc"), def!(term!(primary, terminal!(1, syntax.len() + 15, "x")))),
+      rule!(
+        id!(1, 1, "abc"),
+        def!(term!(primary, terminal!(1, syntax.len() + 15, "x")))
+      ),
     );
   }
 }
@@ -549,7 +596,10 @@ fn stringify() {
   );
 
   // Generate debug string for token
-  assert_eq!("(*ABC*)", lex::Token::Comment(location(1, 1), "ABC".to_string()).debug());
+  assert_eq!(
+    "(*ABC*)",
+    lex::Token::Comment(location(1, 1), "ABC".to_string()).debug()
+  );
   assert_eq!(
     "\" \\t\\r\\n\"",
     lex::Token::GapSeparatorSequence(location(1, 1), " \t\r\n".to_string()).debug()
@@ -580,13 +630,27 @@ repeat = { abc }, [ xyz | abc ], ("d", "e", "f") ;
           term!(terminal!(2, 17, "Z"))
         ]
       ),
-      rule!(id!(3, 1, "abc d"), def![term!(id!(3, 10, "abc"))], def![term!(terminal!(3, 16, "D"))]),
-      rule!(id!(4, 6, "abcxyz"), def!(term!(id!(4, 28, "abc"))), def!(term!(id!(4, 46, "xyz")))),
+      rule!(
+        id!(3, 1, "abc d"),
+        def![term!(id!(3, 10, "abc"))],
+        def![term!(terminal!(3, 16, "D"))]
+      ),
+      rule!(
+        id!(4, 6, "abcxyz"),
+        def!(term!(id!(4, 28, "abc"))),
+        def!(term!(id!(4, 46, "xyz")))
+      ),
       rule!(
         id!(5, 1, "repeat"),
         def!(
           term!(repeat!(5, 10, 1, def!(term!(id!(5, 12, "abc"))))),
-          term!(option!(5, 19, 1, def!(term!(id!(5, 21, "xyz"))), def!(term!(id!(5, 27, "abc"))))),
+          term!(option!(
+            5,
+            19,
+            1,
+            def!(term!(id!(5, 21, "xyz"))),
+            def!(term!(id!(5, 27, "abc")))
+          )),
           term!(grouped!(
             5,
             34,
@@ -657,17 +721,14 @@ fn assert_correct_syntax_rule(syntax_rule: &str, expected: lex::SyntaxRule) {
   assert_correct_syntax_rules(syntax_rule, vec![expected]);
 }
 
-fn assert_eq_definition_list(
-  i: usize,
-  expected: &lex::DefinitionList,
-  actual: &lex::DefinitionList,
-) {
-  assert_eq!(
-    expected.0.len(),
-    actual.0.len(),
-    "[{}] The length of definition-list are not match.",
-    i
-  );
+fn assert_eq_definition_list(i: usize, expected: &lex::DefinitionList, actual: &lex::DefinitionList) {
+  if expected.0.len() != actual.0.len() {
+    assert_eq!(
+      expected.0, actual.0,
+      "[{}] The length of definition-list are not match.",
+      i
+    );
+  }
   for (j, (expected, actual)) in expected.0.iter().zip(actual.0.iter()).enumerate() {
     assert_eq!(
       expected.syntactic_terms.len(),
@@ -676,8 +737,11 @@ fn assert_eq_definition_list(
       i,
       j
     );
-    for (k, (expected, actual)) in
-      expected.syntactic_terms.iter().zip(actual.syntactic_terms.iter()).enumerate()
+    for (k, (expected, actual)) in expected
+      .syntactic_terms
+      .iter()
+      .zip(actual.syntactic_terms.iter())
+      .enumerate()
     {
       assert_eq!(
         expected.syntactic_exception, actual.syntactic_exception,
@@ -692,24 +756,15 @@ fn assert_eq_definition_list(
         i, j, k
       );
       match (&expected.syntactic_primary, &actual.syntactic_primary) {
-        (
-          lex::SyntacticPrimary::OptionalSequence(l1, dl1),
-          lex::SyntacticPrimary::OptionalSequence(l2, dl2),
-        ) => {
+        (lex::SyntacticPrimary::OptionalSequence(l1, dl1), lex::SyntacticPrimary::OptionalSequence(l2, dl2)) => {
           assert_eq!(l1, l2, "[{},{},{}] location is not match.", i, j, k);
           assert_eq_definition_list(i, dl1, dl2);
         }
-        (
-          lex::SyntacticPrimary::RepeatedSequence(l1, dl1),
-          lex::SyntacticPrimary::RepeatedSequence(l2, dl2),
-        ) => {
+        (lex::SyntacticPrimary::RepeatedSequence(l1, dl1), lex::SyntacticPrimary::RepeatedSequence(l2, dl2)) => {
           assert_eq!(l1, l2, "[{},{},{}] location is not match.", i, j, k);
           assert_eq_definition_list(i, dl1, dl2);
         }
-        (
-          lex::SyntacticPrimary::GroupedSequence(l1, dl1),
-          lex::SyntacticPrimary::GroupedSequence(l2, dl2),
-        ) => {
+        (lex::SyntacticPrimary::GroupedSequence(l1, dl1), lex::SyntacticPrimary::GroupedSequence(l2, dl2)) => {
           assert_eq!(l1, l2, "[{},{},{}] location is not match.", i, j, k);
           assert_eq_definition_list(i, dl1, dl2);
         }
@@ -722,9 +777,19 @@ fn assert_eq_definition_list(
 fn assert_incorrect_syntax_rules(syntax_rules: &str, line: usize, col: usize, pattern: &str) {
   let re = Regex::new(pattern).unwrap();
   let assert_error = |err: crate::Error| {
-    assert_eq!(line as u64, err.location.lines, "Line number doesn't match: {}", err.message);
-    assert_eq!(col as u64, err.location.columns, "Column number doesn't match: {}", err.message);
-    assert!(re.is_match(&err.message), "message doesn't match: {:?} != {:?}", pattern, err.message);
+    assert_eq!(
+      line as u64, err.location.lines,
+      "Line number doesn't match: {}",
+      err.message
+    );
+    assert_eq!(
+      col as u64, err.location.columns,
+      "Column number doesn't match: {}",
+      err.message
+    );
+    if !re.is_match(&err.message) {
+      assert_eq!(pattern, err.message);
+    }
   };
   let mut lexer = Lexer::new(FILE_NAME);
   for i in 1..=syntax_rules.len() {
@@ -739,7 +804,9 @@ fn assert_incorrect_syntax_rules(syntax_rules: &str, line: usize, col: usize, pa
       }
     }
     assert_error(
-      lexer.flush().expect_err(&format!("No error was encountered: {:?}", syntax_rules)),
+      lexer
+        .flush()
+        .expect_err(&format!("No error was encountered: {:?}", syntax_rules)),
     );
   }
 }
@@ -747,18 +814,9 @@ fn assert_incorrect_syntax_rules(syntax_rules: &str, line: usize, col: usize, pa
 const FILE_NAME: &str = "C:\\like Windows File System\\with space\\path.ebnf";
 
 fn location(lines: usize, columns: usize) -> Location {
-  Location { name: FILE_NAME.to_string(), lines: lines as u64, columns: columns as u64 }
-}
-
-fn split_by(syntax_rules: &str, chars: usize) -> Vec<String> {
-  let syntax_rules = syntax_rules.chars().collect::<Vec<char>>();
-  let mut chunks = Vec::new();
-  let div = syntax_rules.len() / chars + if syntax_rules.len() % chars != 0 { 1 } else { 0 };
-  for i in 0..div {
-    let begin = i * chars;
-    let end = std::cmp::min((i + 1) * chars, syntax_rules.len());
-    let chunk = syntax_rules[begin..end].iter().collect::<String>();
-    chunks.push(chunk);
+  Location {
+    name: FILE_NAME.to_string(),
+    lines: lines as u64,
+    columns: columns as u64,
   }
-  chunks
 }

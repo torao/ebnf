@@ -1,4 +1,4 @@
-use crate::{Error, Location, Result};
+use crate::{lex::is_gap_separator_char, Error, Location, Result};
 
 #[cfg(test)]
 mod test;
@@ -227,16 +227,6 @@ fn is_other_char(ch: char) -> bool {
 }
 
 #[inline]
-fn is_gap_separator_char(ch: char) -> bool {
-  ch == ' ' // space
-    || ch == '\t' // horizontal-tabulation
-    || ch == '\r' // new-line (carriage  return)
-    || ch == '\n' // new-line (line feed)
-    || ch == 0x0B as char // vertical-tabulation
-    || ch == 0x0C as char // form-feed
-}
-
-#[inline]
 fn is_meta_identifier_first_char(ch: char) -> bool {
   is_letter_char(ch)
 }
@@ -270,12 +260,7 @@ fn is_special_sequence_char(ch: char) -> bool {
 /// * `None` - Characters in the buffer are not sufficient to determine the token (need to
 ///   wait for more characters to arrive).
 ///
-fn read_next(
-  loc: &Location,
-  buffer: &[char],
-  position: usize,
-  flush: bool,
-) -> Result<Option<(Token, usize)>> {
+fn read_next(loc: &Location, buffer: &[char], position: usize, flush: bool) -> Result<Option<(Token, usize)>> {
   fn ok(token: Token, offset: usize) -> Result<Option<(Token, usize)>> {
     Ok(Some((token, offset)))
   }
@@ -353,45 +338,46 @@ fn read_next(
     }
     '*' => {
       if !flush && buffer[position + 1] == ')' {
-        Err(Error::new(loc, format!("end-comment-symbol '{}' is not opened.", END_COMMENT_SYMBOL)))
+        Err(Error::new(
+          loc,
+          format!("end-comment-symbol '{}' is not opened.", END_COMMENT_SYMBOL),
+        ))
       } else {
         ok(Token::RepetitionSymbol(loc.clone()), 1)
       }
     }
     '?' => special_sequence(loc, buffer, position, flush),
-    meta_identifier if is_meta_identifier_first_char(meta_identifier) => {
-      Ok(read_while(&buffer, position + 1, is_meta_identifier_char, flush).map(|end| {
+    meta_identifier if is_meta_identifier_first_char(meta_identifier) => Ok(
+      read_while(&buffer, position + 1, is_meta_identifier_char, flush).map(|end| {
         let meta_identifier = buffer[position..end].iter().collect::<String>();
         (Token::MetaIdentifier(loc.clone(), meta_identifier), end - position)
-      }))
-    }
-    digit if is_decimal_digit_char(digit) => {
-      Ok(read_while(&buffer, position + 1, is_decimal_digit_char, flush).map(|end| {
+      }),
+    ),
+    digit if is_decimal_digit_char(digit) => Ok(read_while(&buffer, position + 1, is_decimal_digit_char, flush).map(
+      |end| {
         let decimal_digit = buffer[position..end].iter().collect::<String>();
         (Token::Integer(loc.clone(), decimal_digit), end - position)
-      }))
-    }
-    gap if is_gap_separator_char(gap) => {
-      Ok(read_while(&buffer, position + 1, is_gap_separator_char, flush).map(|end| {
+      },
+    )),
+    gap if is_gap_separator_char(gap) => Ok(read_while(&buffer, position + 1, is_gap_separator_char, flush).map(
+      |end| {
         let gap = buffer[position..end].iter().collect::<String>();
         (Token::GapSeparatorSequence(loc.clone(), gap), end - position)
-      }))
-    }
+      },
+    )),
     unknown => Err(Error::new(
       &loc,
-      format!("An undefined character was detected: {:?} (U+{:04X})", unknown, unknown as u32),
+      format!(
+        "An undefined character was detected: {:?} (U+{:04X})",
+        unknown, unknown as u32
+      ),
     )),
   }
 }
 
 /// `terminal_string()` function reads and consumes a single terminal-string from the current position.
 ///
-fn terminal_string(
-  loc: &Location,
-  buffer: &[char],
-  position: usize,
-  flush: bool,
-) -> Result<Option<(Token, usize)>> {
+fn terminal_string(loc: &Location, buffer: &[char], position: usize, flush: bool) -> Result<Option<(Token, usize)>> {
   let quote = buffer[position];
 
   // Find location of the corresponding quote.
@@ -400,7 +386,10 @@ fn terminal_string(
     if !is_terminal_char(buffer[end]) {
       return Err(Error::new(
         loc,
-        format!("terminal-string contains a character {:?} that cannot be used.", buffer[end]),
+        format!(
+          "terminal-string contains a character {:?} that cannot be used.",
+          buffer[end]
+        ),
       ));
     }
     end += 1;
@@ -408,7 +397,10 @@ fn terminal_string(
 
   if end == buffer.len() {
     if flush {
-      Err(Error::new(loc, format!("terminal-string is not closed with {:?}.", quote)))
+      Err(Error::new(
+        loc,
+        format!("terminal-string is not closed with {:?}.", quote),
+      ))
     } else {
       Ok(None)
     }
@@ -425,12 +417,7 @@ fn terminal_string(
 
 /// `special_sequence()` function reads and consumes a single special-sequence from the current position.
 ///
-fn special_sequence(
-  loc: &Location,
-  buffer: &[char],
-  position: usize,
-  flush: bool,
-) -> Result<Option<(Token, usize)>> {
+fn special_sequence(loc: &Location, buffer: &[char], position: usize, flush: bool) -> Result<Option<(Token, usize)>> {
   const SPECIAL_SEQUENCE_SYMBOL: char = '?';
 
   // Find location of the corresponding question.
@@ -439,7 +426,10 @@ fn special_sequence(
     if !is_special_sequence_char(buffer[end]) {
       return Err(Error::new(
         loc,
-        format!("special-sequence contains a character {:?} that cannot be used.", buffer[end]),
+        format!(
+          "special-sequence contains a character {:?} that cannot be used.",
+          buffer[end]
+        ),
       ));
     }
     end += 1;
@@ -465,21 +455,18 @@ const END_COMMENT_SYMBOL: &str = "*)";
 
 /// `comment()` function reads and consumes a single (may be nexted) comment-squence from the current position.
 ///
-fn comment(
-  loc: &Location,
-  buffer: &[char],
-  position: usize,
-  flush: bool,
-) -> Result<Option<(Token, usize)>> {
+fn comment(loc: &Location, buffer: &[char], position: usize, flush: bool) -> Result<Option<(Token, usize)>> {
+  let mut location = loc.clone();
   let mut nested_depth = 0;
 
+  location.push_str(START_COMMENT_SYMBOL);
   let mut end = position + 2;
   loop {
     if end >= buffer.len() {
       return if flush {
         Err(Error::new(
           loc,
-          format!("start-comment-symbol '{}' is not closed.", START_COMMENT_SYMBOL),
+          format!("This start-comment-symbol '{}' is not closed.", START_COMMENT_SYMBOL),
         ))
       } else {
         Ok(None)
@@ -495,20 +482,19 @@ fn comment(
       nested_depth += 1;
     } else if !is_gap_separator_char(buffer[end]) && !is_terminal_char(buffer[end]) {
       return Err(Error::new(
-        loc,
-        format!("The comment contains a character {:?} that cannot be used.", buffer[end]),
+        &location,
+        format!(
+          "This comment contains a character {:?} (U+{:04X}) that cannot be used as a comment.",
+          buffer[end], buffer[end] as u32
+        ),
       ));
     }
+    location.push(buffer[end]);
     end += 1;
   }
 }
 
-fn read_while(
-  buffer: &[char],
-  position: usize,
-  eval: fn(char) -> bool,
-  flush: bool,
-) -> Option<usize> {
+fn read_while(buffer: &[char], position: usize, eval: fn(char) -> bool, flush: bool) -> Option<usize> {
   let mut position = position;
   while position < buffer.len() && eval(buffer[position]) {
     position += 1;

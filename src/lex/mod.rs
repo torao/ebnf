@@ -1,5 +1,7 @@
 //! `lex` is a low-level module for parsing Extended BNF syntax and constructing [`SyntaxRule`]s.
 //!
+//! This is useful if you are interested in the syntactic structure of EBNF, for example rustdoc.
+//!
 use std::{
   fmt::{Display, Write},
   fs::File,
@@ -40,39 +42,15 @@ pub fn parse_str(name: &str, syntax: &str) -> Result<Vec<SyntaxRule>> {
   Ok(rules)
 }
 
-pub fn parse_file(
-  file_name: &str,
-  encoding: &str,
-  max_buffer_size: usize,
-) -> Result<Vec<SyntaxRule>> {
-  let mut file =
-    File::open(file_name).map_err(|err| Error::new(&Location::new(file_name), err.to_string()))?;
-  parse(&mut file, file_name, encoding, max_buffer_size)
+pub fn parse_file(file_name: &str, encoding: &str, max_buffer_size: usize) -> Result<Vec<SyntaxRule>> {
+  let mut file = File::open(file_name).map_err(|err| Error::new(&Location::new(file_name), err.to_string()))?;
+  parse(file_name, &mut file, encoding, max_buffer_size)
 }
 
 /// `parse()` function parses the Extended BNF syntax read from the specified stream and restores
 /// the [`SyntaxRule`]s.
 ///
-/// Any EBNF syntax that needs to buffer more than `max_buffer_size` will result in an error. This
-/// limit is important so as not to cause a critical resource craving when reading streams of
-/// unknown length.
-///
-/// # Parameters
-///
-/// * `r` - Input stream from which the EBNF syntax is read.
-/// * `name` - The name of the stream (e.g., file name or URL). This string is used to indicate its
-///   location in case of errors.
-/// * `encoding` - The encoding of characters to be read from the input stream `r`, such as
-///   `"utf-8"` or `"Shift_JIS"`. For encoding name that can be specified, see
-///   <https://encoding.spec.whatwg.org/>.
-/// * `max_buffer_size` - Maximum size of the internal buffer. If 0, the buffer size isn't limited.
-///
-pub fn parse(
-  r: &mut dyn Read,
-  name: &str,
-  encoding: &str,
-  max_buffer_size: usize,
-) -> Result<Vec<SyntaxRule>> {
+pub fn parse(name: &str, r: &mut dyn Read, encoding: &str, max_buffer_size: usize) -> Result<Vec<SyntaxRule>> {
   let mut decoder = Decoder::new(name, encoding, false)?;
   let mut lexer = Lexer::with_capacity(name, tokenizer::DEFAULT_INIT_BUFFER_SIZE, max_buffer_size);
   let mut rules = Vec::new();
@@ -82,7 +60,10 @@ pub fn parse(
       Ok(len) if len == 0 => break, // EOF reached
       Ok(len) => len,
       Err(err) => {
-        return Err(Error::new(&lexer.tokenizer.location, format!("Failed to load data: {}", err)));
+        return Err(Error::new(
+          &lexer.tokenizer.location,
+          format!("Failed to load data: {}", err),
+        ));
       }
     };
     let input = decoder.push(&buffer[0..length])?;
@@ -133,7 +114,10 @@ impl Lexer {
   ///   error when it occurs.
   ///
   pub fn new(name: &str) -> Lexer {
-    Lexer { tokenizer: Tokenizer::new(name), tokens: Vec::new() }
+    Lexer {
+      tokenizer: Tokenizer::new(name),
+      tokens: Vec::new(),
+    }
   }
 
   /// Construct a new EBNF Lexer with a specified buffer size limit.
@@ -290,6 +274,20 @@ pub enum SyntacticPrimary {
   EmptySequence(Location),
 }
 
+impl SyntacticPrimary {
+  pub fn location<'a>(&'a self) -> &'a Location {
+    match self {
+      SyntacticPrimary::OptionalSequence(location, ..) => location,
+      SyntacticPrimary::RepeatedSequence(location, ..) => location,
+      SyntacticPrimary::GroupedSequence(location, ..) => location,
+      SyntacticPrimary::MetaIdentifier(location, ..) => location,
+      SyntacticPrimary::TerminalString(location, ..) => location,
+      SyntacticPrimary::SpecialSequence(location, ..) => location,
+      SyntacticPrimary::EmptySequence(location, ..) => location,
+    }
+  }
+}
+
 impl Display for SyntacticPrimary {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
@@ -358,7 +356,11 @@ fn build_syntax_rule(tokens: &[Token]) -> Result<Option<SyntaxRule>> {
     assert!(!meta_identifier.is_empty());
     let location = location.unwrap();
     let definition_list = read_definition_list(tokens, next + 1)?;
-    Ok(Some(SyntaxRule { location, meta_identifier, definition_list }))
+    Ok(Some(SyntaxRule {
+      location,
+      meta_identifier,
+      definition_list,
+    }))
   }
 }
 
@@ -412,46 +414,66 @@ fn read_syntactic_term(tokens: &[Token], position: usize) -> Result<(SyntacticTe
   } else {
     (None, next)
   };
-  Ok((SyntacticTerm { syntactic_factor, syntactic_exception }, position))
+  Ok((
+    SyntacticTerm {
+      syntactic_factor,
+      syntactic_exception,
+    },
+    position,
+  ))
 }
 
 fn read_syntactic_factor(tokens: &[Token], position: usize) -> Result<(SyntacticFactor, usize)> {
   let position = skip_comment_or_gap_separator(tokens, position);
-  let (repetition, next) = match &tokens[position] {
-    Token::Integer(_, repetition) => {
-      let repetition = match repetition.parse::<u32>() {
-        Ok(repetition) => repetition,
-        Err(error) => {
-          return Err(Error::new(
-            tokens[position].location(),
-            format!(
-              "cannot convert the number of repetitions {:?} to 32-bit integer: {}",
-              repetition, error
-            ),
-          ))
-        }
-      };
-      let i = skip_comment_or_gap_separator(tokens, position + 1);
-      if !tokens[i].is_repetition_symbol() {
+  let (repetition, next) = if position >= tokens.len() {
+    (1, position)
+  } else if let Token::Integer(_, repetition) = &tokens[position] {
+    let repetition = match repetition.parse::<u32>() {
+      Ok(repetition) => repetition,
+      Err(error) => {
         return Err(Error::new(
-          tokens[i].location(),
-          format!("repetition-symbol '*' expected, but {} appeared.", tokens[i].name()),
-        ));
+          tokens[position].location(),
+          format!(
+            "cannot convert the number of repetitions {:?} to 32-bit integer: {}",
+            repetition, error
+          ),
+        ))
       }
-      (repetition, skip_comment_or_gap_separator(tokens, i + 1))
+    };
+    let i = skip_comment_or_gap_separator(tokens, position + 1);
+    if !tokens[i].is_repetition_symbol() {
+      return Err(Error::new(
+        tokens[i].location(),
+        format!("repetition-symbol '*' expected, but {} appeared.", tokens[i].name()),
+      ));
     }
-    _ => (1, position),
+    (repetition, skip_comment_or_gap_separator(tokens, i + 1))
+  } else {
+    (1, position)
   };
   let (syntactic_primary, next) = read_syntactic_primary(tokens, next)?;
-  Ok((SyntacticFactor { repetition, syntactic_primary }, next))
+  Ok((
+    SyntacticFactor {
+      repetition,
+      syntactic_primary,
+    },
+    next,
+  ))
 }
 
 fn read_syntactic_primary(tokens: &[Token], position: usize) -> Result<(SyntacticPrimary, usize)> {
   let i = skip_comment_or_gap_separator(tokens, position);
+  if i >= tokens.len() {
+    let location = if let Some(last) = tokens.last() {
+      last.location().clone()
+    } else {
+      Location::new("<unknown>")
+    };
+    return Ok((SyntacticPrimary::EmptySequence(location), i));
+  }
   match &tokens[i] {
     Token::StartOptionSymbol(location, start_option_symbol) => {
-      if *start_option_symbol == "(/" && i + 1 < tokens.len() && tokens[i + 1].is_end_group_symbol()
-      {
+      if *start_option_symbol == "(/" && i + 1 < tokens.len() && tokens[i + 1].is_end_group_symbol() {
         // Invalid character sequence: (/)
         return Err(Error::new(
           location,
@@ -464,11 +486,13 @@ fn read_syntactic_primary(tokens: &[Token], position: usize) -> Result<(Syntacti
         |tk| tk.is_start_option_symbol(),
         |tk| tk.is_end_option_symbol(),
       )?;
-      Ok((SyntacticPrimary::OptionalSequence(location.clone(), definition_list), next))
+      Ok((
+        SyntacticPrimary::OptionalSequence(location.clone(), definition_list),
+        next,
+      ))
     }
     Token::StartRepeatSymbol(location, start_repeat_symbol) => {
-      if *start_repeat_symbol == "(:" && i + 1 < tokens.len() && tokens[i + 1].is_end_group_symbol()
-      {
+      if *start_repeat_symbol == "(:" && i + 1 < tokens.len() && tokens[i + 1].is_end_group_symbol() {
         // Invalid character sequence: (:)
         return Err(Error::new(
           location,
@@ -481,7 +505,10 @@ fn read_syntactic_primary(tokens: &[Token], position: usize) -> Result<(Syntacti
         |tk| tk.is_start_repeat_symbol(),
         |tk| tk.is_end_repeat_symbol(),
       )?;
-      Ok((SyntacticPrimary::RepeatedSequence(location.clone(), definition_list), next))
+      Ok((
+        SyntacticPrimary::RepeatedSequence(location.clone(), definition_list),
+        next,
+      ))
     }
     Token::StartGroupSymbol(location) => {
       let (definition_list, next) = read_enclosed_definition_list(
@@ -490,18 +517,26 @@ fn read_syntactic_primary(tokens: &[Token], position: usize) -> Result<(Syntacti
         |tk| tk.is_start_group_symbol(),
         |tk| tk.is_end_group_symbol(),
       )?;
-      Ok((SyntacticPrimary::GroupedSequence(location.clone(), definition_list), next))
+      Ok((
+        SyntacticPrimary::GroupedSequence(location.clone(), definition_list),
+        next,
+      ))
     }
     Token::MetaIdentifier(location, _) => {
       let (meta_identifier, _, next) = read_meta_identifier(tokens, i);
-      Ok((SyntacticPrimary::MetaIdentifier(location.clone(), meta_identifier), next))
+      Ok((
+        SyntacticPrimary::MetaIdentifier(location.clone(), meta_identifier),
+        next,
+      ))
     }
-    Token::TerminalString(location, content, _) => {
-      Ok((SyntacticPrimary::TerminalString(location.clone(), content.clone()), i + 1))
-    }
-    Token::SpecialSequence(location, content) => {
-      Ok((SyntacticPrimary::SpecialSequence(location.clone(), content.clone()), i + 1))
-    }
+    Token::TerminalString(location, content, _) => Ok((
+      SyntacticPrimary::TerminalString(location.clone(), content.clone()),
+      i + 1,
+    )),
+    Token::SpecialSequence(location, content) => Ok((
+      SyntacticPrimary::SpecialSequence(location.clone(), content.clone()),
+      i + 1,
+    )),
     token => Ok((SyntacticPrimary::EmptySequence(token.location().clone()), i)),
   }
 }
@@ -532,7 +567,11 @@ fn read_enclosed_definition_list(
   }
   Err(Error::new(
     tokens[position].location(),
-    format!("{} '{}' is not closed.", tokens[position].name(), tokens[position].debug()),
+    format!(
+      "{} '{}' is not closed.",
+      tokens[position].name(),
+      tokens[position].debug()
+    ),
   ))
 }
 
@@ -593,9 +632,7 @@ impl Token {
       Token::RepetitionSymbol(loc) => (loc, "repetition-symbol", "*".to_string()),
       Token::ExceptSymbol(loc) => (loc, "except-symbol", "-".to_string()),
       Token::ConcatenateSymbol(loc) => (loc, "concatenate-symbol", ",".to_string()),
-      Token::DefinitionSeparatorSymbol(loc, sym) => {
-        (loc, "definition-separator-symbol", format!("{:?}", sym))
-      }
+      Token::DefinitionSeparatorSymbol(loc, sym) => (loc, "definition-separator-symbol", format!("{:?}", sym)),
       Token::DefiningSymbol(loc) => (loc, "defining-symbol", "=".to_string()),
       Token::TerminatorSymbol(loc, sym) => (loc, "terminator-symbol", format!("{}", sym)),
       Token::StartOptionSymbol(loc, sym) => (loc, "start-option-symbol", format!("{}", sym)),
@@ -609,9 +646,7 @@ impl Token {
       Token::Integer(loc, value) => (loc, "integer", value.to_string()),
       Token::Comment(loc, content) => (loc, "comment", format!("(*{}*)", content.to_string())),
       Token::SpecialSequence(loc, content) => (loc, "special-sequence", content.to_string()),
-      Token::GapSeparatorSequence(loc, gap) => {
-        (loc, "gap-separator-sequence", format!("{:?}", gap))
-      }
+      Token::GapSeparatorSequence(loc, gap) => (loc, "gap-separator-sequence", format!("{:?}", gap)),
       Token::EOF(loc) => (loc, "EOF", String::from("")),
     }
   }
@@ -696,4 +731,14 @@ impl Token {
       _ => false,
     }
   }
+}
+
+#[inline]
+pub fn is_gap_separator_char(ch: char) -> bool {
+  ch == ' ' // space
+    || ch == '\t' // horizontal-tabulation
+    || ch == '\r' // new-line (carriage  return)
+    || ch == '\n' // new-line (line feed)
+    || ch == 0x0B as char // vertical-tabulation
+    || ch == 0x0C as char // form-feed
 }

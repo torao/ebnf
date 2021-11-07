@@ -2,7 +2,11 @@
 //!
 use crate::{Error, Location, Result};
 use encoding_rs::{CoderResult, Encoding};
-use std::io::{Cursor, Read};
+use std::{
+  collections::HashSet,
+  io::{Cursor, Read},
+  str::Chars,
+};
 
 #[cfg(test)]
 pub mod test;
@@ -52,6 +56,34 @@ pub trait CharReader {
   }
 }
 
+struct BufferedCharReader {
+  chars: Vec<char>,
+}
+
+impl CharReader for BufferedCharReader {
+  fn read_chars(&mut self, buffer: &mut [char]) -> Result<usize> {
+    let length = std::cmp::min(buffer.len(), self.chars.len());
+    for (i, ch) in self.chars.drain(0..length).enumerate() {
+      buffer[i] = ch;
+    }
+    Ok(length)
+  }
+}
+
+impl<'a> From<&'a str> for Box<dyn CharReader> {
+  fn from(s: &'a str) -> Self {
+    From::from(s.chars())
+  }
+}
+
+impl<'a> From<Chars<'a>> for Box<dyn CharReader> {
+  fn from(iter: Chars<'a>) -> Self {
+    Box::new(BufferedCharReader {
+      chars: iter.collect::<Vec<char>>(),
+    })
+  }
+}
+
 /// A character stream that implements mark, reset, and skip of the read position.
 ///
 pub struct SyntaxReader {
@@ -59,7 +91,7 @@ pub struct SyntaxReader {
   lookahead_buffer: Vec<char>,
   // TODO: INtroduce the upper limit of the buffer size for marks.
   mark_stack: Vec<(usize, Location, Vec<char>)>,
-  mark_sequence: usize,
+  mark_index: Index,
   location: Location,
 }
 
@@ -67,8 +99,15 @@ impl SyntaxReader {
   pub fn new(name: &str, r: Box<dyn CharReader>) -> Self {
     let lookahead_buffer = Vec::new();
     let mark_stack = Vec::new();
+    let mark_index = Index::new();
     let location = Location::new(name);
-    SyntaxReader { r, lookahead_buffer, mark_stack, mark_sequence: 0, location }
+    SyntaxReader {
+      r,
+      lookahead_buffer,
+      mark_stack,
+      mark_index,
+      location,
+    }
   }
 
   pub fn with_encoding(name: &str, r: Box<dyn Read>, encoding: &str) -> Result<Self> {
@@ -169,9 +208,8 @@ impl SyntaxReader {
   /// Identifier of the marked position.
   ///
   pub fn mark(&mut self) -> Result<usize> {
-    let marker = self.mark_sequence;
+    let marker = self.mark_index.acquire(&self.location)?;
     self.mark_stack.push((marker, self.location.clone(), Vec::new()));
-    self.mark_sequence += 1;
     Ok(marker)
   }
 
@@ -189,6 +227,7 @@ impl SyntaxReader {
       self.lookahead_buffer.splice(0..0, unread);
       self.location = location;
     }
+    self.mark_index.release(marker);
     Ok(undo_length)
   }
 
@@ -206,6 +245,7 @@ impl SyntaxReader {
         clear_length += self.mark_stack[j].2.len();
       }
       self.mark_stack.clear();
+      debug_assert_eq!(1, self.mark_index.len());
     } else {
       while self.mark_stack.len() > i {
         let mut removal = self.mark_stack.remove(i);
@@ -213,6 +253,7 @@ impl SyntaxReader {
         self.mark_stack[i - 1].2.append(&mut removal.2);
       }
     }
+    self.mark_index.release(marker);
     Ok(clear_length)
   }
 
@@ -232,7 +273,10 @@ impl SyntaxReader {
         return Ok(i);
       }
     }
-    Err(Error::new(&self.location, format!("The specified mark is invalid: {}", marker)))
+    Err(Error::new(
+      &self.location,
+      format!("The specified mark is invalid: {}", marker),
+    ))
   }
 }
 
@@ -298,11 +342,18 @@ impl CharDecodeReader {
   /// Reader, or error if the `encoding` is undefined.
   ///
   pub fn new(name: &str, r: Box<dyn Read>, encoding: &str) -> Result<Self> {
+    let r = r.into();
     let decoder = Decoder::new(name, encoding, false)?;
     let read_buffer = [0u8; 1024].to_vec();
     let remaining_buffer = Vec::new();
     let location = Location::new(name);
-    Ok(CharDecodeReader { r, decoder, read_buffer, remaining_buffer, location })
+    Ok(CharDecodeReader {
+      r,
+      decoder,
+      read_buffer,
+      remaining_buffer,
+      location,
+    })
   }
 
   pub fn for_bytes(name: &str, bytes: Vec<u8>, encoding: &str) -> Result<Self> {
@@ -402,7 +453,13 @@ impl Decoder {
 
     let encoding = encoding.to_string();
     let buffer = Vec::new();
-    Ok(Decoder { encoding, decoder, location, stop_with_garbled, buffer })
+    Ok(Decoder {
+      encoding,
+      decoder,
+      location,
+      stop_with_garbled,
+      buffer,
+    })
   }
 
   /// Adds a fragment of a byte sequence and returns a string that can be decoded to that point.
@@ -441,8 +498,9 @@ impl Decoder {
     let mut output_buffer = String::with_capacity(256);
     let mut output = String::with_capacity(self.buffer.len());
     loop {
-      let (result, read, garbled) =
-        self.decoder.decode_to_string(&self.buffer[position..], &mut output_buffer, flush);
+      let (result, read, garbled) = self
+        .decoder
+        .decode_to_string(&self.buffer[position..], &mut output_buffer, flush);
       position += read;
       if !output_buffer.is_empty() {
         output.push_str(&output_buffer);
@@ -466,7 +524,9 @@ impl Decoder {
     let position = output.chars().position(|c| c == '\u{FFFD}').unwrap_or(0);
     let from = self.location.clone();
     let mut to = from.clone();
-    self.location.push_str(&output.chars().take(position + 1).collect::<String>());
+    self
+      .location
+      .push_str(&output.chars().take(position + 1).collect::<String>());
     to.push_str(output);
     return Err(Error::new(
       &self.location,
@@ -475,5 +535,36 @@ impl Decoder {
         self.encoding, from.lines, from.columns, to.lines, to.columns
       ),
     ));
+  }
+}
+
+struct Index {
+  next: usize,
+  in_use: HashSet<usize>,
+}
+
+impl Index {
+  pub fn new() -> Self {
+    Index {
+      next: 0,
+      in_use: HashSet::with_capacity(32),
+    }
+  }
+  pub fn acquire(&mut self, location: &Location) -> Result<usize> {
+    if self.in_use.len() == usize::MAX {
+      return Err(Error::new(location, "Too many mark operations."));
+    }
+    let mut i = self.next;
+    while self.in_use.contains(&i) {
+      i = if i == usize::MAX { 0 } else { i + 1 };
+    }
+    self.next = i + 1;
+    Ok(i)
+  }
+  pub fn release(&mut self, i: usize) {
+    self.in_use.remove(&i);
+  }
+  pub fn len(&self) -> usize {
+    self.in_use.len()
   }
 }

@@ -1,3 +1,9 @@
 # https://github.com/rust-lang/rustfmt/blob/master/Configurations.md
 tab_spaces = 2
-use_small_heuristics = "Max"
+max_width = 120
+#use_small_heuristics = "Max"
+#merge_imports = true
+newline_style = "Unix"
+#imports_granularity = "Module"
+#blank_lines_upper_bound = 1
+#format_code_in_doc_comments = true

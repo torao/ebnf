@@ -94,6 +94,12 @@ fn syntax_reader_peek_skip() {
 }
 
 #[test]
+fn syntax_reader_prefix_match() {
+  let mut r = SyntaxReader::new("", From::from("\nhello, world"));
+  assert!(!r.prefix_matches(&"hello".chars().collect::<Vec<char>>()).unwrap());
+}
+
+#[test]
 fn syntax_reader_read_error() {
   let (encoded, _) = encode("Shift_JIS", "零壱弐");
   let r = Box::new(ErrorRead::new(&encoded, "something's wrong"));
@@ -138,7 +144,9 @@ fn decode_expected_encoding_bytes() {
   assert_restore(
     "utf-8",
     "あいうえお",
-    &[0xE3u8, 0x81, 0x82, 0xE3, 0x81, 0x84, 0xE3, 0x81, 0x86, 0xE3, 0x81, 0x88, 0xE3, 0x81, 0x8A],
+    &[
+      0xE3u8, 0x81, 0x82, 0xE3, 0x81, 0x84, 0xE3, 0x81, 0x86, 0xE3, 0x81, 0x88, 0xE3, 0x81, 0x8A,
+    ],
   );
 }
 
@@ -151,7 +159,9 @@ fn encoder_encounter_garbled_text() {
   let err = decoder.push(&encoded).unwrap_err();
   assert_eq!(Location::with_location("", 1, 3), err.location);
   assert!(
-    err.message.contains("Detected a byte sequence that cannot be changed to Shift_JIS"),
+    err
+      .message
+      .contains("Detected a byte sequence that cannot be changed to Shift_JIS"),
     "{}",
     err.message
   );
@@ -164,7 +174,11 @@ fn assert_restore(encoding: &str, expected: &str, test: &[u8]) {
     "The expected string contains a character that cannot be encoded in {}: {}",
     encoding, expected
   );
-  assert_eq!(encoded, test, "The test string doesn't match the assumption in {}.", encoding);
+  assert_eq!(
+    encoded, test,
+    "The test string doesn't match the assumption in {}.",
+    encoding
+  );
 
   // Decode in chunks of various lengths.
   for i in 1..=test.len() {
@@ -185,7 +199,11 @@ fn encode(encoding: &str, s: &str) -> (Vec<u8>, bool) {
 }
 
 fn hex_str(s: &str) -> String {
-  s.as_bytes().iter().map(|c| format!("{:02X}", c)).collect::<Vec<String>>().join(" ")
+  s.as_bytes()
+    .iter()
+    .map(|c| format!("{:02X}", c))
+    .collect::<Vec<String>>()
+    .join(" ")
 }
 
 fn split_by<'a>(buffer: &'a [u8], bytes: usize) -> Vec<&'a [u8]> {
@@ -208,14 +226,20 @@ pub struct ErrorRead {
 
 impl ErrorRead {
   pub fn new(bytes: &[u8], message: &str) -> ErrorRead {
-    ErrorRead { remaining: bytes.to_vec(), message: message.to_string() }
+    ErrorRead {
+      remaining: bytes.to_vec(),
+      message: message.to_string(),
+    }
   }
 }
 
 impl Read for ErrorRead {
   fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
     if self.remaining.is_empty() {
-      Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, self.message.to_string()))
+      Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        self.message.to_string(),
+      ))
     } else {
       let len = std::cmp::min(self.remaining.len(), buf.len());
       buf.write_all(&self.remaining[0..len])?;
@@ -254,7 +278,10 @@ fn assert_encode_decode(encoding: &str, expected: &str) {
   assert!(!garbled);
   for bytes in 1..encoded.len() {
     // CharReader::read_chars(), read_all()
-    let chunks = split_by(&encoded, bytes).iter().map(|s| s.to_vec()).collect::<Vec<Vec<u8>>>();
+    let chunks = split_by(&encoded, bytes)
+      .iter()
+      .map(|s| s.to_vec())
+      .collect::<Vec<Vec<u8>>>();
     let r = Box::new(ChunkedRead { chunks });
     let mut r = CharDecodeReader::new("foo.ebnf", r, encoding).unwrap();
     let actual = r.read_all().unwrap();
@@ -265,14 +292,21 @@ fn assert_encode_decode(encoding: &str, expected: &str) {
     );
 
     // CharReader::read()
-    let chunks = split_by(&encoded, bytes).iter().map(|s| s.to_vec()).collect::<Vec<Vec<u8>>>();
+    let chunks = split_by(&encoded, bytes)
+      .iter()
+      .map(|s| s.to_vec())
+      .collect::<Vec<Vec<u8>>>();
     let r = Box::new(ChunkedRead { chunks });
     let mut r = CharDecodeReader::new("foo.ebnf", r, encoding).unwrap();
     let mut actual = String::new();
     while let Some(ch) = r.read().unwrap() {
       actual.push(ch);
     }
-    assert_eq!(expected, actual, "CharReader::read() decode failed: {}, bytes={}", encoding, bytes);
+    assert_eq!(
+      expected, actual,
+      "CharReader::read() decode failed: {}, bytes={}",
+      encoding, bytes
+    );
   }
 
   // Decode test

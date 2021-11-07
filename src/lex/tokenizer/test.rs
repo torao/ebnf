@@ -91,7 +91,10 @@ fn terminal_string() {
     let expected = (' '..0x7F as char).filter(|c| *c != quote).collect::<String>();
     assert_correct_syntax_rules(
       format!("{}{}{}", quote, expected, quote).as_str(),
-      vec![Token::TerminalString(location(1, 1), expected, quote), Token::EOF(location(1, 97))],
+      vec![
+        Token::TerminalString(location(1, 1), expected, quote),
+        Token::EOF(location(1, 97)),
+      ],
     );
 
     // All characters unavailable for terminal-string.
@@ -119,8 +122,11 @@ fn terminal_string() {
       format!("{}ABC", quote).as_str(),
       1,
       1,
-      format!("terminal-string is not closed with {}\\.", regex::escape(&format!("{:?}", quote)))
-        .as_str(),
+      format!(
+        "terminal-string is not closed with {}\\.",
+        regex::escape(&format!("{:?}", quote))
+      )
+      .as_str(),
     );
   }
 }
@@ -141,7 +147,10 @@ fn special_sequence() {
   // Empty special-sequence.
   assert_correct_syntax_rules(
     "??",
-    vec![Token::SpecialSequence(location(1, 1), "".to_string()), Token::EOF(location(1, 3))],
+    vec![
+      Token::SpecialSequence(location(1, 1), "".to_string()),
+      Token::EOF(location(1, 3)),
+    ],
   );
 
   // 7-bit chharacters between 0x20-0x7E are available.
@@ -157,20 +166,16 @@ fn special_sequence() {
   );
 
   // Control codes smaller than 0x20 and 8-bit characters larger than or equal 0x7F cannot be used.
-  for invalid_char in (0 as char..' ').chain(0x7F as char..0x80 as char).filter(|ch| {
-    *ch != '\t' && *ch != '\n' && *ch != '\r' && *ch != 0x0B as char && *ch != 0x0C as char
-  }) {
+  for invalid_char in (0 as char..' ')
+    .chain(0x7F as char..0x80 as char)
+    .filter(|ch| *ch != '\t' && *ch != '\n' && *ch != '\r' && *ch != 0x0B as char && *ch != 0x0C as char)
+  {
     let special = format!("?{}?", invalid_char);
     assert_incorrect_syntax_rules(&special, 1, 1, "special-sequence contains a character.*");
   }
 
   // In case the special-sequence hasn't been completed.
-  assert_incorrect_syntax_rules(
-    "? not completed",
-    1,
-    1,
-    "special-sequence is not closed with '\\?'\\.",
-  )
+  assert_incorrect_syntax_rules("? not completed", 1, 1, "special-sequence is not closed with '\\?'\\.")
 }
 
 #[test]
@@ -232,7 +237,12 @@ fn assert_incorrect_syntax_rules(syntax_rules: &str, line: usize, column: usize,
     "column is not match: {} != {}",
     column, err.location.columns
   );
-  assert!(re.is_match(&err.message), "message doesn't match: {} != {}", msg_regex, err.message);
+  assert!(
+    re.is_match(&err.message),
+    "message doesn't match: {} != {}",
+    msg_regex,
+    err.message
+  );
 }
 
 fn tokenize_in_various_split(syntax_rules: &str, expected: Vec<Token>) -> Result<()> {
@@ -265,5 +275,9 @@ fn tokenize_in_various_split(syntax_rules: &str, expected: Vec<Token>) -> Result
 const FILE_NAME: &str = "C:\\like Windows File System\\with space\\path.ebnf";
 
 fn location(lines: usize, columns: usize) -> Location {
-  Location { name: FILE_NAME.to_string(), lines: lines as u64, columns: columns as u64 }
+  Location {
+    name: FILE_NAME.to_string(),
+    lines: lines as u64,
+    columns: columns as u64,
+  }
 }
