@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
   keyed_meta_identifier,
@@ -12,6 +12,7 @@ use super::{
   LexMachine,
 };
 
+#[derive(Debug)]
 pub struct Instruction {
   pub next: Option<usize>,
   pub symbol: String,
@@ -42,10 +43,44 @@ pub enum Prospect {
 }
 
 pub enum Step {
-  Repetition { min: u32, max: u32, subroutine: usize },
-  Or { subroutines: Vec<usize> },
-  Step { scanner: Box<dyn Scanner> },
-  Alias { meta_identifier: String },
+  Repetition {
+    min: u32,
+    max: u32,
+    subroutine: usize,
+  },
+  Or {
+    subroutines: Vec<usize>,
+  },
+  Step {
+    location: Location,
+    scanner: Box<dyn Scanner>,
+  },
+  Alias {
+    meta_identifier: String,
+  },
+}
+
+impl Debug for Step {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Repetition { min, max, subroutine } => f
+        .debug_struct("Repetition")
+        .field("min", min)
+        .field("max", max)
+        .field("subroutine", subroutine)
+        .finish(),
+      Self::Or { subroutines } => f.debug_struct("Or").field("subroutines", subroutines).finish(),
+      Self::Step { location, .. } => f
+        .debug_struct("Step")
+        .field("location", location)
+        .field("scanner", &"***")
+        .finish(),
+      Self::Alias { meta_identifier } => f
+        .debug_struct("Alias")
+        .field("meta_identifier", meta_identifier)
+        .finish(),
+    }
+  }
 }
 
 pub struct LexGraph {
@@ -87,10 +122,6 @@ impl LexGraph {
   pub fn canonical_name(&self, meta_identifier: &str) -> Option<&str> {
     let id = keyed_meta_identifier(meta_identifier);
     self.canonical_names.get(&id).map(|s| s.as_str())
-  }
-
-  pub fn step(&self, i: usize) -> &Instruction {
-    &self.interactions[i]
   }
 
   pub fn index_of_label(&self, meta_identifier: &str) -> Option<usize> {
@@ -166,6 +197,7 @@ fn register_syntactic_term(
       symbol: term.to_string(),
       definition: term.syntactic_factor.syntactic_primary.location().clone(),
       step: Step::Step {
+        location: Location::with_location(file!(), line!() as u64, column!() as u64),
         scanner: Box::new(TermWithExceptionScanner::new(factor, exception)),
       },
     };
@@ -212,7 +244,7 @@ fn register_syntactic_primary(
   let mut symbol = primary.to_string();
   let (step, definition): (Step, Location) = match &primary {
     SyntacticPrimary::OptionalSequence(definition, list) => {
-      let subroutine = register_definition_list(steps, next, list, config);
+      let subroutine = register_definition_list(steps, None, list, config);
       (
         Step::Repetition {
           min: 0,
@@ -223,7 +255,7 @@ fn register_syntactic_primary(
       )
     }
     SyntacticPrimary::RepeatedSequence(definition, list) => {
-      let subroutine = register_definition_list(steps, next, list, config);
+      let subroutine = register_definition_list(steps, None, list, config);
       (
         Step::Repetition {
           min: 0,
@@ -233,7 +265,7 @@ fn register_syntactic_primary(
         definition.clone(),
       )
     }
-    SyntacticPrimary::GroupedSequence(_, list) => return register_definition_list(steps, next, list, config),
+    SyntacticPrimary::GroupedSequence(_, list) => return register_definition_list(steps, None, list, config),
     SyntacticPrimary::MetaIdentifier(definition, meta_identifier) => {
       symbol = meta_identifier.to_string();
       let meta_identifier = meta_identifier.to_string();
@@ -244,6 +276,7 @@ fn register_syntactic_primary(
       let terminal_string = terminal_string.chars().collect::<Vec<_>>();
       (
         Step::Step {
+          location: Location::with_location(file!(), line!() as u64, column!() as u64),
           scanner: Box::new(TerminalStringScanner::new(terminal_string)),
         },
         definition.clone(),
@@ -254,6 +287,7 @@ fn register_syntactic_primary(
       symbol = scanner.symbol();
       (
         Step::Step {
+          location: Location::with_location(file!(), line!() as u64, column!() as u64),
           scanner: Box::new(SpecialSequenceScanner::new(scanner)),
         },
         definition.clone(),
@@ -263,6 +297,7 @@ fn register_syntactic_primary(
       symbol = String::from("EMPTY");
       (
         Step::Step {
+          location: Location::with_location(file!(), line!() as u64, column!() as u64),
           scanner: Box::new(EmptyScanner::new()),
         },
         definition.clone(),

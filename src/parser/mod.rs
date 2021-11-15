@@ -1,14 +1,19 @@
-mod graph;
+pub mod graph;
 mod machine;
 
 #[cfg(test)]
 mod test;
 
-use crate::{Error, Location, Result};
+use std::fmt::{Debug, Formatter};
 
-use self::{
-  graph::{LexGraph, Prospect},
-  machine::LexMachine,
+use regex::Regex;
+
+use crate::{
+  parser::{
+    graph::{LexGraph, Prospect},
+    machine::LexMachine,
+  },
+  Error, Location, Result,
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -76,15 +81,19 @@ pub struct Parser<'a> {
 
   /// Location of the `buffer` head.
   location: Location,
+
+  filter: EventFilter,
 }
 
 impl<'a> Parser<'a> {
   pub fn new(graph: &'a LexGraph, meta_identifier: &str, max_buffer_size: usize, name: &str) -> Option<Self> {
+    let max_buffer_size = if max_buffer_size == 0 { 1024 } else { max_buffer_size };
     LexMachine::new(graph, meta_identifier).map(|machine| Parser {
       machine,
       buffer: Vec::new(),
       max_buffer_size,
       location: Location::new(name),
+      filter: EventFilter::new(),
     })
   }
 
@@ -122,21 +131,37 @@ impl<'a> Parser<'a> {
   }
 
   fn proceed(&mut self, flush: bool) -> Result<Vec<Event>> {
-    let (consumed, tokens) = self.machine.proceed(&self.location, &self.buffer, flush)?;
+    let (consumed, events) = self.machine.proceed(&self.location, &self.buffer, flush)?;
     let consumed = self.buffer.drain(0..consumed);
     self.location.push_chars(&consumed.collect::<Vec<_>>());
-    Ok(tokens)
+    Ok(self.filter.push(events, flush))
   }
 }
 
-pub enum Ack {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Reaction {
+  /// `NeedMore` indicates that more characters need to arrive to determine if it's a match or
+  /// a unmatch, and shouldn't be returned when flushed.
   NeedMore,
-  Match { length: usize, event: Option<Event> },
+
+  /// `Match` indicates that the token was restored by matching the specified number of characters
+  /// at the beginning of the `buffer`. If there is no token to be restored, the `token` will be
+  /// `None`.
+  Match { length: usize, token: Option<String> },
+
+  /// `Unmatch` indicates that the beginning of the specified buffer wasn't matched.
   Unmatch,
+
+  /// `Forward` indicates that the matching process is forwarded to the specified meta-identifier.
+  /// When the matching of the meta-identifier is completed, it returns and continues the
+  /// processing of this special sequence.
+  Forward { meta_identifier: String },
 }
 
-pub trait ParseContext {}
-
+/// `SpecialSequenceParser` is a factory for generating a [`SpecialSequenceScanner`] when the
+/// Parser encounters a special-sequence.
+/// By using SS, applications can implement their own extensions for special-sequence.
+///
 pub struct SpecialSequenceParser(Box<dyn Fn(&Location, &str) -> Box<dyn SpecialSequenceScanner>>);
 
 impl SpecialSequenceParser {
@@ -147,36 +172,238 @@ impl SpecialSequenceParser {
 
 impl Default for SpecialSequenceParser {
   fn default() -> Self {
-    Self::new(Box::new(|_: &Location, _: &str| -> Box<dyn SpecialSequenceScanner> {
-      Box::new(Ignore::Continue)
-    }))
+    Self::new(Box::new(
+      |_: &Location, content: &str| -> Box<dyn SpecialSequenceScanner> {
+        Box::new(DefaultScanner {
+          content: content.to_string(),
+        })
+      },
+    ))
+  }
+}
+
+#[derive(Debug)]
+struct DefaultScanner {
+  content: String,
+}
+
+impl SpecialSequenceScanner for DefaultScanner {
+  fn symbol(&self) -> String {
+    format!("?{}?", self.content)
+  }
+
+  fn scan(&self, _: &Location, _: &[char], _: bool) -> Result<Reaction> {
+    Ok(Reaction::Match { length: 0, token: None })
   }
 }
 
 pub trait SpecialSequenceScanner: std::fmt::Debug {
   fn symbol(&self) -> String;
-  fn scan(&self, context: &mut dyn ParseContext, buffer: &[char], flush: bool) -> Result<Ack>;
+  fn scan(&self, location: &Location, buffer: &[char], flush: bool) -> Result<Reaction>;
 }
 
-#[derive(Debug)]
-pub enum Ignore {
-  Continue,
-  Reject,
+/// A scanner that can specify predication and repetition in character units.
+pub struct CharsScanner {
+  predicator: Box<dyn Fn(char) -> bool>,
+  min: Option<usize>,
+  max: Option<usize>,
 }
 
-impl SpecialSequenceScanner for Ignore {
+impl CharsScanner {
+  pub fn new(predicator: Box<dyn Fn(char) -> bool>, min: Option<usize>, max: Option<usize>) -> Self {
+    CharsScanner { predicator, min, max }
+  }
+  pub fn with_one_of(predicator: Box<dyn Fn(char) -> bool>) -> Self {
+    Self::with_range(predicator, 1, 1)
+  }
+  pub fn with_one_or_more(predicator: Box<dyn Fn(char) -> bool>) -> Self {
+    Self::with_min(predicator, 1)
+  }
+  pub fn with_zero_or_more(predicator: Box<dyn Fn(char) -> bool>) -> Self {
+    Self::new(predicator, None, None)
+  }
+  pub fn with_min(predicator: Box<dyn Fn(char) -> bool>, min: usize) -> Self {
+    Self::new(predicator, Some(min), None)
+  }
+  pub fn with_max(predicator: Box<dyn Fn(char) -> bool>, max: usize) -> Self {
+    Self::new(predicator, None, Some(max))
+  }
+  pub fn with_range(predicator: Box<dyn Fn(char) -> bool>, min: usize, max: usize) -> Self {
+    Self::new(predicator, Some(min), Some(max))
+  }
+}
+
+impl Debug for CharsScanner {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+    f.debug_struct("CharsScanner")
+      .field("min", &self.min)
+      .field("max", &self.max)
+      .finish()
+  }
+}
+
+impl SpecialSequenceScanner for CharsScanner {
   fn symbol(&self) -> String {
-    match self {
-      Ignore::Continue => "?continue?".to_string(),
-      Ignore::Reject => "?reject?".to_string(),
+    String::from("?chars?")
+  }
+  fn scan(&self, _location: &Location, buffer: &[char], flush: bool) -> Result<Reaction> {
+    let max = if let Some(max) = self.max {
+      std::cmp::min(buffer.len(), max)
+    } else {
+      buffer.len()
+    };
+    let mut i = 0;
+    while i < max {
+      if !(self.predicator)(buffer[i]) {
+        break;
+      }
+      i += 1;
+    }
+
+    let in_range = self.min.map(|min| i >= min).unwrap_or(true) && self.max.map(|max| i <= max).unwrap_or(true);
+    if in_range && (i < buffer.len() || (i == buffer.len() && flush)) {
+      Ok(Reaction::Match {
+        length: i,
+        token: Some(buffer[..i].iter().collect::<String>()),
+      })
+    } else if i == buffer.len() && !flush {
+      Ok(Reaction::NeedMore)
+    } else {
+      Ok(Reaction::Unmatch)
+    }
+  }
+}
+
+/// based on [regex crate](https://docs.rs/regex/).
+#[derive(Debug)]
+pub struct RegExScanner {
+  definition: Location,
+  regex: Regex,
+}
+
+impl RegExScanner {
+  pub fn new(definition: &Location, regex: Regex) -> Self {
+    Self {
+      definition: definition.clone(),
+      regex,
+    }
+  }
+  pub fn from_str(definition: &Location, re: &str) -> Result<Self> {
+    match Regex::new(re) {
+      Ok(regex) => Ok(Self::new(definition, regex)),
+      Err(err) => Err(Error::new(definition, format!("Malformed regular expression: {}", err))),
+    }
+  }
+}
+
+impl SpecialSequenceScanner for RegExScanner {
+  fn symbol(&self) -> String {
+    format!("?{}?", self.regex.to_string())
+  }
+  fn scan(&self, _location: &Location, buffer: &[char], flush: bool) -> Result<Reaction> {
+    let text = buffer.iter().collect::<String>();
+    if let Some(matcher) = self.regex.find(&text) {
+      if matcher.start() > 0 {
+        Ok(Reaction::Unmatch)
+      } else if matcher.end() == text.len() {
+        Ok(if flush {
+          Reaction::Match {
+            length: buffer.len(),
+            token: Some(text),
+          }
+        } else {
+          Reaction::NeedMore
+        })
+      } else {
+        let length = matcher.end();
+        let token = &text[..length];
+        Ok(Reaction::Match {
+          length: token.chars().count(),
+          token: Some(token.to_string()),
+        })
+      }
+    } else {
+      Ok(Reaction::Unmatch)
+    }
+  }
+}
+
+/// A filter function to remove non-terminal symbols from the event sequence that appear in the
+/// parsing process. However, even if the entire syntax tree is empty, the non-terminal symbol
+/// of the root is returned without deletion.
+///
+struct EventFilter {
+  buffer: Vec<Event>,
+  first_event_returned: bool,
+}
+
+impl EventFilter {
+  pub fn new() -> Self {
+    Self {
+      buffer: Vec::new(),
+      first_event_returned: false,
     }
   }
 
-  fn scan(&self, _context: &mut dyn ParseContext, _buffer: &[char], _flush: bool) -> Result<Ack> {
-    Ok(match self {
-      Ignore::Continue => Ack::Match { length: 0, event: None },
-      Ignore::Reject => Ack::Unmatch {},
-    })
+  pub fn push(&mut self, mut events: Vec<Event>, flush: bool) -> Vec<Event> {
+    self.buffer.append(&mut events);
+
+    // The first event of the parser, the start event of the meta-identifier, is passed through
+    // without being removed. This preserves the top-level `Event::Begin` and `Event::End` even if
+    // it's empty.
+    if !self.first_event_returned && !self.buffer.is_empty() {
+      events.push(self.buffer.remove(0));
+      self.first_event_returned = true;
+    }
+
+    // If `Event::Begin` and `Event::End` pair are consecutive, remove them.
+    let mut i = 0;
+    while i + 1 < self.buffer.len() {
+      if let Event::Begin {
+        definition: def1,
+        location: loc1,
+        label: lab1,
+      } = &self.buffer[i]
+      {
+        if let Event::End {
+          definition: def2,
+          location: loc2,
+          label: lab2,
+        } = &self.buffer[i + 1]
+        {
+          if def1 == def2 && loc1 == loc2 && lab1 == lab2 {
+            self.buffer.drain(i..i + 2);
+            if i != 0 {
+              i -= 1;
+            }
+            continue;
+          }
+        }
+      }
+      i += 1;
+    }
+
+    if flush {
+      events.append(&mut self.buffer);
+    } else {
+      let last_token = self.buffer.iter().enumerate().rfind(|(_, e)| match *e {
+        Event::Token { .. } => true,
+        _ => false,
+      });
+      if let Some((mut i, _)) = last_token {
+        i += 1;
+        while i < self.buffer.len() {
+          if let Event::End { .. } = &self.buffer[i] {
+            i += 1;
+          } else {
+            break;
+          }
+        }
+        events.append(&mut self.buffer.drain(0..i).collect::<Vec<Event>>());
+      }
+    }
+
+    events
   }
 }
 

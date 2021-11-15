@@ -1,14 +1,14 @@
 use std::io::{Read, Write};
 
 use crate::{
-  io::{CharDecodeReader, CharReader, Decoder, SyntaxReader},
+  io::{CharDecodeReader, CharReader, Decoder, MarkableReader},
   Location,
 };
 
 #[test]
-fn syntax_reader_mark_reset() {
+fn makable_reader_mark_reset() {
   let (encoded, _) = encode("Shift_JIS", "零壱弐参四五六七八九");
-  let mut r = SyntaxReader::for_bytes("", encoded.to_vec(), "Shift_JIS").unwrap();
+  let mut r = MarkableReader::for_bytes("", encoded.to_vec(), "Shift_JIS").unwrap();
 
   assert_eq!('零', r.read().unwrap().unwrap());
   assert_eq!('壱', r.read().unwrap().unwrap());
@@ -57,7 +57,7 @@ fn syntax_reader_mark_reset() {
 
   // The first level can be restored after the second level is cleared.
   let (encoded, _) = encode("Shift_JIS", "零壱弐参四五六七八九");
-  let mut r = SyntaxReader::for_bytes("", encoded.to_vec(), "Shift_JIS").unwrap();
+  let mut r = MarkableReader::for_bytes("", encoded.to_vec(), "Shift_JIS").unwrap();
   assert_eq!('零', r.read().unwrap().unwrap());
   assert_eq!('壱', r.read().unwrap().unwrap());
   let marker1 = r.mark().unwrap();
@@ -76,9 +76,9 @@ fn syntax_reader_mark_reset() {
 }
 
 #[test]
-fn syntax_reader_peek_skip() {
+fn makable_reader_peek_skip() {
   let (encoded, _) = encode("Shift_JIS", "零壱弐参四五六七八九");
-  let mut r = SyntaxReader::for_bytes("", encoded.to_vec(), "Shift_JIS").unwrap();
+  let mut r = MarkableReader::for_bytes("", encoded.to_vec(), "Shift_JIS").unwrap();
   assert_eq!('零', r.read().unwrap().unwrap());
   assert_eq!("壱弐参", r.peek(3).unwrap());
   assert_eq!('壱', r.read().unwrap().unwrap());
@@ -94,16 +94,16 @@ fn syntax_reader_peek_skip() {
 }
 
 #[test]
-fn syntax_reader_prefix_match() {
-  let mut r = SyntaxReader::new("", From::from("\nhello, world"));
+fn makable_reader_prefix_match() {
+  let mut r = MarkableReader::new("", From::from("\nhello, world"));
   assert!(!r.prefix_matches(&"hello".chars().collect::<Vec<char>>()).unwrap());
 }
 
 #[test]
-fn syntax_reader_read_error() {
+fn makable_reader_read_error() {
   let (encoded, _) = encode("Shift_JIS", "零壱弐");
   let r = Box::new(ErrorRead::new(&encoded, "something's wrong"));
-  let mut r = SyntaxReader::with_encoding("", r, "Shift_JIS").unwrap();
+  let mut r = MarkableReader::with_encoding("", r, "Shift_JIS").unwrap();
   assert_eq!('零', r.read().unwrap().unwrap());
   assert_eq!('壱', r.read().unwrap().unwrap());
   assert_eq!('弐', r.read().unwrap().unwrap());

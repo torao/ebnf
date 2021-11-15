@@ -5,6 +5,62 @@
 //!
 //! # Examples
 //!
+//! From the [Extended Backus–Naur form](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form)
+//! sample on Wikipedia.
+//!
+//! ```rust
+//! use std::io::Cursor;
+//! use ebnf::Syntax;
+//! use ebnf::parser::{graph::{GraphConfig, LexGraph}, Parser, SpecialSequenceScanner, SpecialSequenceParser, CharsScanner};
+//!
+//! let source_name = "sample.ebnf";
+//! let syntax = r#"(* a simple program syntax in EBNF - Wikipedia *)
+//! program = 'PROGRAM', white space, identifier, white space,
+//!  'BEGIN', white space,
+//!  { assignment, ";", white space },
+//!  'END.' ;
+//! identifier = alphabetic character, { alphabetic character | digit } ;
+//! number = [ "-" ], digit, { digit } ;
+//! string = '"' , { all characters - '"' }, '"' ;
+//! assignment = identifier , ":=" , ( number | identifier | string ) ;
+//! alphabetic character = "A" | "B" | "C" | "D" | "E" | "F" | "G"
+//!            | "H" | "I" | "J" | "K" | "L" | "M" | "N"
+//!            | "O" | "P" | "Q" | "R" | "S" | "T" | "U"
+//!            | "V" | "W" | "X" | "Y" | "Z" ;
+//! digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+//! white space = ? white space characters ? ;
+//! all characters = ? all visible characters ? ;"#;
+//! let mut cursor = Cursor::new(syntax.as_bytes());
+//! let syntax = Syntax::read_from_utf8(source_name, &mut cursor, 1024).unwrap();
+//! let mut config = GraphConfig::new();
+//! config.special_sequence_parser(SpecialSequenceParser::new(
+//!   Box::new(|_, label| special_sequence_scanner(label))
+//! ));
+//! let graph = LexGraph::compile(&syntax, &config);
+//! let mut parser = Parser::new(&graph, "program", 1024, source_name).unwrap();
+//!
+//! let mut events = Vec::new();
+//! events.append(&mut parser.push_str(r#"PROGRAM DEMO1
+//!BEGIN
+//!  A:=3;
+//!  B:=45;
+//!  H:=-100023;
+//!  C:=A;
+//!  D123:=B34A;
+//!  BABOON:=GIRAFFE;
+//!  TEXT:="Hello world!";
+//!END."#).unwrap());
+//! events.append(&mut parser.flush().unwrap());
+//!
+//! fn special_sequence_scanner(label: &str) -> Box<dyn SpecialSequenceScanner> {
+//!   Box::new(match label.trim() {
+//!     "white space characters" => CharsScanner::with_one_or_more(Box::new(|c| c.is_whitespace() || c.is_ascii_control())),
+//!     "all visible characters" => CharsScanner::with_one_or_more(Box::new(|c| !c.is_whitespace() && !c.is_ascii_control())),
+//!     _ => panic!("unexpected special-sequence!: {:?}", label),
+//!   })
+//! }
+//! ```
+//!
 //! If you just want to refer to the syntactic structure of EBNF, use the [`lex`] module. You can use [`lex::parse()`]
 //! or [`lex::parse_str()`] to restore the syntax definition.
 //!
@@ -33,10 +89,19 @@
 //! open parentheses = '#' | '#(' | '/';
 //! ```
 //!
+//! パイプライン設計されたこのライブラリは、フラグメント化された構文の文字を順次評価することで、可能な限りの構文解析を進行する。
+//! ただし、パターンの判定が必要になる命令では内部にデータを蓄えることがある。EBNF 構文の設計によってはターゲットとなるテキスト
+//! のほぼ全てをメモリ上にバッファリングする動作となる可能性があることに注意。
+//!
+//! * definition-list: 縦線で区切られた選択肢のなかでどの選択肢に進むべきかを判断するとき、選択肢の中のいずれかが確定する
+//!   までのデータを蓄積する。
+//! * syntactic-exception 付きの syntactic-term:
+//!
 use embed_doc_image::embed_doc_image;
 use std::{
   collections::HashMap,
   fmt::{Display, Formatter},
+  io::Cursor,
 };
 
 // pub mod graph;
@@ -47,6 +112,7 @@ mod validity;
 
 #[cfg(test)]
 pub mod test;
+pub mod scan;
 
 /// `Result` in the `ebnf` library represents processing result that it can be either a result with arbitrary type `T`
 /// or an [`Error`].
@@ -115,6 +181,10 @@ impl Syntax {
     self.syntax_rules.iter()
   }
 
+  pub fn rule(&self, index: usize) -> Option<&lex::SyntaxRule> {
+    self.syntax_rules.get(index)
+  }
+
   /// Reads EBNF syntax from the specified input stream and builds a [`Syntax`].
   ///
   /// ![ebnf::Syntax::read_from()][Syntax::read_from]
@@ -124,10 +194,10 @@ impl Syntax {
   /// use ebnf::Syntax;
   ///
   /// let mut cursor = Cursor::new("abc = 'A', ('B' | 'C'); xyz = 'X', 'Y', 'Z';");
-  /// let syntax = Syntax::from("/your/path/to/file.ebnf", &mut cursor, "utf-8", 0).unwrap();
-  /// assert_eq!(2, syntax.syntax_rules.len());
-  /// assert_eq!("abc", syntax.syntax_rules[0].meta_identifier);
-  /// assert_eq!("xyz", syntax.syntax_rules[1].meta_identifier);
+  /// let syntax = Syntax::read_from_utf8("/your/path/to/file.ebnf", &mut cursor, 0).unwrap();
+  /// assert_eq!("abc", syntax.rule(0).unwrap().meta_identifier);
+  /// assert_eq!("xyz", syntax.rule(1).unwrap().meta_identifier);
+  /// assert_eq!(None, syntax.rule(2));
   /// ```
   ///
   /// See [lex::Lexer] for a more low-level and efficient operation.
@@ -153,6 +223,11 @@ impl Syntax {
 
   pub fn read_from_utf8(name: &str, r: &mut dyn std::io::Read, max_buffer_size: usize) -> Result<Self> {
     Self::read_from(name, r, "utf-8", max_buffer_size)
+  }
+
+  pub fn read_from_str(name: &str, syntax: &str, max_buffer_size: usize) -> Result<Self> {
+    let mut cursor = Cursor::new(syntax.as_bytes());
+    Self::read_from_utf8(name, &mut cursor, max_buffer_size)
   }
 
   /// `get_syntax_rule()` returns the syntax-rule corresponding to the specified meta-identifier.
@@ -324,15 +399,15 @@ pub enum Node {
   Complex { children: Vec<AST> },
 }
 
-/// `canonical_meta_identifier()` converts the specified meta-identifier string to its formal
+/// `normalized_meta_identifier()` converts the specified meta-identifier string to its formal
 /// name in the definition.
 /// This function removes leading and trailing whitespace in the string and converts one or more
 /// whitespace into a single space.
 ///
 /// ```
-/// use ebnf::canonical_meta_identifier;
+/// use ebnf::normalized_meta_identifier;
 ///
-/// assert_eq!("quick brown fox", canonical_meta_identifier(" quick\tbrown\n\tfox"));
+/// assert_eq!("quick brown fox", normalized_meta_identifier(" quick\tbrown\n\tfox"));
 /// ```
 ///
 pub fn normalized_meta_identifier(meta_identifier: &str) -> String {

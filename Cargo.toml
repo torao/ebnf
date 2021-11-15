@@ -18,7 +18,8 @@ maintenance = { status = "passively-maintained" }
 
 [dependencies]
 encoding_rs = "0.8"
+regex = "1"
 embed-doc-image = "0.1"
 
 [dev-dependencies]
-regex = "1"
+rand = "0.8"

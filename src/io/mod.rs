@@ -86,7 +86,7 @@ impl<'a> From<Chars<'a>> for Box<dyn CharReader> {
 
 /// A character stream that implements mark, reset, and skip of the read position.
 ///
-pub struct SyntaxReader {
+pub struct MarkableReader {
   r: Box<dyn CharReader>,
   lookahead_buffer: Vec<char>,
   // TODO: INtroduce the upper limit of the buffer size for marks.
@@ -95,13 +95,13 @@ pub struct SyntaxReader {
   location: Location,
 }
 
-impl SyntaxReader {
+impl MarkableReader {
   pub fn new(name: &str, r: Box<dyn CharReader>) -> Self {
     let lookahead_buffer = Vec::new();
     let mark_stack = Vec::new();
     let mark_index = Index::new();
     let location = Location::new(name);
-    SyntaxReader {
+    MarkableReader {
       r,
       lookahead_buffer,
       mark_stack,
@@ -280,7 +280,7 @@ impl SyntaxReader {
   }
 }
 
-impl CharReader for SyntaxReader {
+impl CharReader for MarkableReader {
   fn read_chars(&mut self, buffer: &mut [char]) -> Result<usize> {
     if !self.lookahead_buffer.is_empty() {
       let len = std::cmp::min(buffer.len(), self.lookahead_buffer.len());

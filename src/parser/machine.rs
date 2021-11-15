@@ -1,17 +1,21 @@
 use std::collections::HashSet;
 
-use crate::{parser::parallel_notation, Error, Location, Result};
-
-use super::{
-  graph::{Instruction, LexGraph, Prospect, Scanner, Step},
-  Ack, Event, ParseContext,
+use crate::{
+  parser::parallel_notation,
+  parser::{
+    graph::{Instruction, LexGraph, Prospect, Scanner, Step},
+    Event, Reaction,
+  },
+  Error, Location, Result,
 };
 
+#[derive(Debug)]
 struct Subroutine {
   control: Control,
   return_address: Option<usize>,
 }
 
+#[derive(Debug)]
 enum Control {
   Repetition {
     min: u32,
@@ -66,6 +70,7 @@ impl<'a> LexMachine<'a> {
     // while consumed < buffer.len() || (flush && !self.stack.is_empty()) {
     while flush || consumed < buffer.len() {
       let prev_stack_size = self.stack.len();
+      let current_position = self.next_start_position;
 
       // Evaluate the execution results
       match self.step_forward(&location, &buffer[consumed..], flush)? {
@@ -82,34 +87,43 @@ impl<'a> LexMachine<'a> {
             livelock.clear();
           } else if livelock.contains(&next) {
             let pos = Self::buffer_to_string(&buffer[consumed..]);
-            let symbol = self
+            let (symbol, definition) = self
               .next_start_position
-              .map(|i| self.graph.step(i).symbol.to_string())
-              .unwrap_or(String::from("EOF"));
-            panic!("{} Livelock: The step {} on {} didn't proceed", location, symbol, pos);
+              .map(|i| self.graph.instruction(i))
+              .flatten()
+              .map(|i| (i.symbol.to_string(), i.definition.clone()))
+              .unwrap_or((String::from("EOF"), Location::with_location("<unknown>", 0, 0)));
+            return Err(Error::new(
+              &location,
+              format!(
+                "Livelock: The step {} defined in {} could not proceed on {}. {:?}",
+                symbol, definition, pos, next
+              ),
+            ));
           } else {
-            livelock.insert(self.next_start_position);
+            livelock.insert(current_position);
           }
 
           self.next_start_position = next;
         }
-        Prospect::WaitingForMore => {
-          break;
-        }
+        Prospect::WaitingForMore => break,
         Prospect::NotThisWay => {
-          if let Some(Subroutine {
-            control: Control::Repetition { min, current, .. },
-            return_address,
-          }) = self.stack.last()
-          {
-            if *current >= *min {
-              // Break the repetitions if at least the minimum number of repetitions condition is met.
-              self.next_start_position = *return_address;
-              self.stack.pop();
-              continue;
+          let break_stack = self.stack.iter().enumerate().rfind(|(_, sr)| match &(*sr).control {
+            Control::Repetition { min, current, .. } if *current >= *min => true,
+            _ => false,
+          });
+          if let Some((i, _)) = break_stack {
+            // Break the repetitions if at least the minimum number of repetitions condition is met.
+            self.next_start_position = self.stack[i].return_address;
+            let disposal = self.stack.drain(i..);
+            for sb in disposal.rev() {
+              if let Control::Block { exit_event } = sb.control {
+                events.push(exit_event);
+              }
             }
+          } else {
+            return self.error_expected_current_step_but_not(&location, &buffer[consumed..]);
           }
-          return self.error_expected_current_step_but_not(&location, &buffer[consumed..]);
         }
       }
     }
@@ -124,37 +138,60 @@ impl<'a> LexMachine<'a> {
   }
 
   fn step_forward(&mut self, location: &Location, buffer: &[char], flush: bool) -> Result<Prospect> {
-    // println!("step_forward({}, {:?}, {})", location, buffer, flush);
     let cursor = if let Some(prospect) = self.move_to_next_start_position(location, buffer, flush)? {
+      println!("step_forward({}, {:?}, {}) -> {:?}", location, buffer, flush, prospect);
       return Ok(prospect);
     } else {
       self.next_start_position.unwrap()
     };
     let instr = self.graph.instruction(cursor).unwrap();
+    print!("step_forward({}, {:?}, {}):", location, buffer, flush);
     let prospect: Prospect = match &instr.step {
-      Step::Repetition { max, .. } if *max == 0 => {
-        // Skip this step if the maximum number of repetition is zero.
-        Prospect::NextStep {
-          length: 0,
-          event: None,
-          next: instr.next,
+      Step::Repetition { min, max, subroutine } => {
+        if *max == 0 {
+          // Skip this step if the maximum number of repetition is zero.
+          Prospect::NextStep {
+            length: 0,
+            event: None,
+            next: instr.next,
+          }
+        } else {
+          match self.pre_eval(*subroutine, location, buffer, flush)? {
+            PreEval::Accept(..) => {
+              let next = self.push_repetitions_onto_stack(*min, *max, *subroutine, instr.next);
+              print!("Repetition({},{},{})", min, max, subroutine);
+              next
+            },
+            PreEval::Reject(..) => {
+              Prospect::NextStep {
+                length: 0,
+                event: None,
+                next: instr.next,
+              }
+            },
+            PreEval::NotSure => Prospect::WaitingForMore,
+          }
         }
       }
-      Step::Repetition { min, max, subroutine } => {
-        self.push_repetitions_onto_stack(*min, *max, *subroutine, instr.next)
-      }
-      Step::Or { subroutines } => match self.select_a_pathway(subroutines, &location, buffer, flush)? {
-        (_, Some(next)) => Prospect::NextStep {
-          length: 0,
-          event: None,
-          next: Some(next),
-        },
-        (PreEval::Reject(..), _) => Prospect::NotThisWay,
-        (PreEval::NotSure, _) => Prospect::WaitingForMore,
-        (PreEval::Accept(..), _) => unreachable!(),
+      Step::Or { subroutines } => {
+        print!("Or({})", subroutines.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        match self.select_a_pathway(subroutines, &location, buffer, flush)? {
+          (_, Some(next)) => Prospect::NextStep {
+            length: 0,
+            event: None,
+            next: Some(next),
+          },
+          (PreEval::Reject(..), _) => Prospect::NotThisWay,
+          (PreEval::NotSure, _) => Prospect::WaitingForMore,
+          (PreEval::Accept(..), _) => unreachable!(),
+        }
       },
-      Step::Step { scanner } => scanner.scan(self, &instr, &location, buffer, flush)?,
+      Step::Step { scanner, .. } => {
+        print!("Step()");
+        scanner.scan(self, &instr, &location, buffer, flush)?
+      },
       Step::Alias { meta_identifier } => {
+        print!("Alias({:?})", meta_identifier);
         let label = self.graph.canonical_name(meta_identifier).unwrap().to_string();
         let address = self.graph.index_of_label(&meta_identifier).expect(&format!(
           "meta-identifier {:?} is not defined (this must be checked during Syntax construction).",
@@ -164,6 +201,7 @@ impl<'a> LexMachine<'a> {
       }
     };
 
+    println!(" -> {:?}", prospect);
     Ok(prospect)
   }
 
@@ -216,13 +254,15 @@ impl<'a> LexMachine<'a> {
   }
 
   fn pre_eval(&mut self, next: usize, location: &Location, buffer: &[char], flush: bool) -> Result<PreEval> {
-    let instr = self.graph.step(next);
+    let instr = self.graph.instruction(next).unwrap();
     match &instr.step {
       Step::Repetition { min, max, subroutine } => {
+        //println!("pre_eval({}, {}, {:?}, {}): Repetition({},{},{})", next, location, buffer, flush, min, max, subroutine);
         let mut offset = 0;
         let mut repetitions = 0;
         while repetitions <= *max {
           match self.pre_eval(*subroutine, location, &buffer[offset..], flush)? {
+            PreEval::Accept(length) if length == 0 && repetitions >= *min => break,
             PreEval::Accept(length) => {
               offset += length;
               repetitions += 1;
@@ -234,8 +274,9 @@ impl<'a> LexMachine<'a> {
         }
         Ok(PreEval::Accept(offset))
       }
-      Step::Step { scanner } => match scanner.scan(self, &instr, location, buffer, flush)? {
+      Step::Step { scanner, .. } => match scanner.scan(self, &instr, location, buffer, flush)? {
         Prospect::NextStep { length, .. } => {
+          //println!("pre_eval({}, {}, {:?}, {}): Step() -> NextStep({})", next, location, buffer, flush, length);
           if let Some(next) = instr.next {
             match self.pre_eval(next, location, &buffer[length..], flush)? {
               PreEval::Accept(len) => Ok(PreEval::Accept(len + length)),
@@ -255,6 +296,7 @@ impl<'a> LexMachine<'a> {
         (p @ _, _) => Ok(p),
       },
       Step::Alias { meta_identifier } => {
+        //println!("pre_eval({}, {}, {:?}, {}): Alias({})", next, location, buffer, flush, meta_identifier);
         let index = self.graph.index_of_label(&meta_identifier).unwrap();
         self.pre_eval(index, location, buffer, flush)
       }
@@ -317,6 +359,7 @@ impl<'a> LexMachine<'a> {
     continue_address: usize,
     return_address: Option<usize>,
   ) -> Prospect {
+    // TODO: Set the upper limit for the number of stackable items.
     self.stack.push(Subroutine {
       control: Control::Repetition {
         min,
@@ -341,6 +384,7 @@ impl<'a> LexMachine<'a> {
     start_address: usize,
     return_address: Option<usize>,
   ) -> Prospect {
+    // TODO: Set the upper limit for the number of stackable items.
     self.stack.push(Subroutine {
       control: Control::Block {
         exit_event: Event::end(definition.clone(), location.clone(), label),
@@ -358,7 +402,7 @@ impl<'a> LexMachine<'a> {
     let actual = Self::buffer_to_string(buffer);
     let symbols = indices
       .iter()
-      .map(|i| self.graph.step(*i).symbol.to_string())
+      .map(|i| self.graph.instruction(*i).unwrap().symbol.to_string())
       .collect::<Vec<_>>();
     let symbols = parallel_notation(symbols, "or");
     Err(Error::new(
@@ -399,8 +443,6 @@ impl<'a> LexMachine<'a> {
     }
   }
 }
-
-impl<'a> ParseContext for LexMachine<'a> {}
 
 pub struct TerminalStringScanner {
   terminal_string: Vec<char>,
@@ -461,18 +503,39 @@ impl Scanner for SpecialSequenceScanner {
     &self,
     context: &mut LexMachine,
     inst: &Instruction,
-    _location: &Location,
+    location: &Location,
     buffer: &[char],
     flush: bool,
   ) -> Result<Prospect> {
-    Ok(match self.scanner.scan(context, buffer, flush)? {
-      Ack::Match { length, event } => Prospect::NextStep {
+    Ok(match self.scanner.scan(location, buffer, flush)? {
+      Reaction::Match { length, token } => Prospect::NextStep {
         length,
-        event,
+        event: token.map(|tk| Event::Token {
+          definition: inst.definition.clone(),
+          location: location.clone(),
+          token: tk,
+        }),
         next: inst.next,
       },
-      Ack::NeedMore => Prospect::WaitingForMore,
-      Ack::Unmatch => Prospect::NotThisWay,
+      Reaction::Forward { meta_identifier } => {
+        if let Some(next) = context.graph.index_of_label(&meta_identifier) {
+          Prospect::NextStep {
+            length: 0,
+            event: None,
+            next: Some(next),
+          }
+        } else {
+          return Err(Error::new(
+            &location,
+            format!(
+              "The non-existent meta-identifier {:?} was directed by the special-sequence {} defined in {}",
+              meta_identifier, inst.symbol, inst.definition
+            ),
+          ));
+        }
+      }
+      Reaction::NeedMore => Prospect::WaitingForMore,
+      Reaction::Unmatch => Prospect::NotThisWay,
     })
   }
 }
