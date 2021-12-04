@@ -1,9 +1,68 @@
 use std::io::{Read, Write};
 
 use crate::{
-  io::{CharDecodeReader, CharReader, Decoder, MarkableReader},
+  io::{CharDecodeReader, CharReader, Decoder, MarkableCharReader, MarkableReader},
   Location,
 };
+
+use super::UnreadBuffer;
+
+#[test]
+fn unread_buffer() {
+  fn read(b: &mut UnreadBuffer) -> char {
+    let mut ch = ['\u{0}'; 1];
+    assert_eq!(1, b.read(&mut ch));
+    ch[0]
+  }
+  fn end(b: &mut UnreadBuffer) -> bool {
+    let mut ch = ['\u{0}'; 1];
+    !b.remains() && b.read(&mut ch) == 0
+  }
+  let mut b = UnreadBuffer::new(Location::new("foo.txt"));
+  assert!(!b.remains());
+
+  // not be buffered if the mark doesn't exist
+  b.append(&"零壱".chars().collect::<Vec<_>>());
+  assert!(!b.remains());
+
+  // returns buffered data if reverted to mark
+  let mark1 = b.mark();
+  b.append(&"弐参".chars().collect::<Vec<_>>());
+  assert!(!b.remains());
+  assert_eq!(2, b.revert(mark1).unwrap());
+  assert!(b.remains());
+  assert_eq!('弐', read(&mut b));
+  assert!(b.remains());
+  assert_eq!('参', read(&mut b));
+  assert!(end(&mut b));
+
+  let mark1 = b.mark();
+  b.append(&"零壱".chars().collect::<Vec<_>>());
+  let mark2 = b.mark();
+  b.append(&"弐参".chars().collect::<Vec<_>>());
+  let _mark3 = b.mark();
+  b.append(&"四五".chars().collect::<Vec<_>>());
+  let mark4 = b.mark();
+  assert!(!b.remains());
+  assert_eq!(0, b.revert(mark4).unwrap());
+  assert!(!b.remains());
+  assert_eq!(4, b.revert(mark2).unwrap());
+  assert!(b.remains());
+  assert_eq!('弐', read(&mut b));
+  assert_eq!('参', read(&mut b));
+  assert_eq!('四', read(&mut b));
+  assert_eq!('五', read(&mut b));
+  assert!(end(&mut b));
+  assert_eq!(6, b.revert(mark1).unwrap());
+  assert!(b.remains());
+  assert_eq!('零', read(&mut b));
+  assert_eq!('壱', read(&mut b));
+  assert_eq!('弐', read(&mut b));
+  assert_eq!('参', read(&mut b));
+  assert_eq!('四', read(&mut b));
+  assert_eq!('五', read(&mut b));
+  assert!(end(&mut b));
+}
 
 #[test]
 fn makable_reader_mark_reset() {
@@ -19,27 +78,27 @@ fn makable_reader_mark_reset() {
   assert_eq!('四', r.read().unwrap().unwrap());
   let marker3 = r.mark().unwrap();
   assert_eq!('五', r.read().unwrap().unwrap());
-  assert_eq!(&Location::with_location("", 1, 7), r.location());
+  assert_eq!(Location::with_location("", 1, 7), r.location());
   assert_eq!(2, r.reset_to_mark(marker2).unwrap());
-  assert_eq!(&Location::with_location("", 1, 5), r.location());
+  assert_eq!(Location::with_location("", 1, 5), r.location());
   assert_eq!('四', r.read().unwrap().unwrap());
-  assert_eq!(&Location::with_location("", 1, 6), r.location());
+  assert_eq!(Location::with_location("", 1, 6), r.location());
   assert!(r.reset_to_mark(marker3).is_err());
-  assert_eq!(&Location::with_location("", 1, 6), r.location());
+  assert_eq!(Location::with_location("", 1, 6), r.location());
   assert_eq!('五', r.read().unwrap().unwrap());
   assert_eq!('六', r.read().unwrap().unwrap());
-  assert_eq!(&Location::with_location("", 1, 8), r.location());
+  assert_eq!(Location::with_location("", 1, 8), r.location());
   assert_eq!(5, r.reset_to_mark(marker1).unwrap());
-  assert_eq!(&Location::with_location("", 1, 3), r.location());
+  assert_eq!(Location::with_location("", 1, 3), r.location());
   assert_eq!('弐', r.read().unwrap().unwrap());
   assert_eq!('参', r.read().unwrap().unwrap());
   let marker4 = r.mark().unwrap();
   assert_eq!('四', r.read().unwrap().unwrap());
   let marker5 = r.mark().unwrap();
   assert_eq!('五', r.read().unwrap().unwrap());
-  assert_eq!(&Location::with_location("", 1, 7), r.location());
-  assert_eq!(2, r.clear_to_mark(marker4).unwrap());
-  assert_eq!(&Location::with_location("", 1, 7), r.location());
+  assert_eq!(Location::with_location("", 1, 7), r.location());
+  r.unmark(marker4).unwrap();
+  assert_eq!(Location::with_location("", 1, 7), r.location());
   assert!(r.reset_to_mark(marker4).is_err());
   assert!(r.reset_to_mark(marker5).is_err());
   assert_eq!('六', r.read().unwrap().unwrap());
@@ -66,7 +125,7 @@ fn makable_reader_mark_reset() {
   let marker2 = r.mark().unwrap();
   assert_eq!('四', r.read().unwrap().unwrap());
   assert_eq!('五', r.read().unwrap().unwrap());
-  assert_eq!(2, r.clear_to_mark(marker2).unwrap());
+  r.unmark(marker2).unwrap();
   assert_eq!('六', r.read().unwrap().unwrap());
   assert_eq!('七', r.read().unwrap().unwrap());
   assert!(r.reset_to_mark(marker2).is_err());
@@ -82,15 +141,15 @@ fn makable_reader_peek_skip() {
   assert_eq!('零', r.read().unwrap().unwrap());
   assert_eq!("壱弐参", r.peek(3).unwrap());
   assert_eq!('壱', r.read().unwrap().unwrap());
-  assert_eq!(&Location::with_location("", 1, 3), r.location());
+  assert_eq!(Location::with_location("", 1, 3), r.location());
   assert_eq!(3, r.skip(3).unwrap());
-  assert_eq!(&Location::with_location("", 1, 6), r.location());
+  assert_eq!(Location::with_location("", 1, 6), r.location());
   assert_eq!('五', r.read().unwrap().unwrap());
   assert_eq!("六七八九", r.peek(100).unwrap());
   assert_eq!('六', r.read().unwrap().unwrap());
   assert_eq!(3, r.skip(100).unwrap());
   assert!(r.read().unwrap().is_none());
-  assert_eq!(&Location::with_location("", 1, 11), r.location());
+  assert_eq!(Location::with_location("", 1, 11), r.location());
 }
 
 #[test]

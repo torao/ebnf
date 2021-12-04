@@ -3,7 +3,6 @@
 use crate::{Error, Location, Result};
 use encoding_rs::{CoderResult, Encoding};
 use std::{
-  collections::HashSet,
   io::{Cursor, Read},
   str::Chars,
 };
@@ -56,8 +55,14 @@ pub trait CharReader {
   }
 }
 
-struct BufferedCharReader {
+pub struct BufferedCharReader {
   chars: Vec<char>,
+}
+
+impl BufferedCharReader {
+  pub fn new(chars: Vec<char>) -> BufferedCharReader {
+    BufferedCharReader { chars }
+  }
 }
 
 impl CharReader for BufferedCharReader {
@@ -84,59 +89,30 @@ impl<'a> From<Chars<'a>> for Box<dyn CharReader> {
   }
 }
 
-/// A character stream that implements mark, reset, and skip of the read position.
-///
-pub struct MarkableReader {
-  r: Box<dyn CharReader>,
-  lookahead_buffer: Vec<char>,
-  // TODO: INtroduce the upper limit of the buffer size for marks.
-  mark_stack: Vec<(usize, Location, Vec<char>)>,
-  mark_index: Index,
-  location: Location,
-}
-
-impl MarkableReader {
-  pub fn new(name: &str, r: Box<dyn CharReader>) -> Self {
-    let lookahead_buffer = Vec::new();
-    let mark_stack = Vec::new();
-    let mark_index = Index::new();
-    let location = Location::new(name);
-    MarkableReader {
-      r,
-      lookahead_buffer,
-      mark_stack,
-      mark_index,
-      location,
-    }
-  }
-
-  pub fn with_encoding(name: &str, r: Box<dyn Read>, encoding: &str) -> Result<Self> {
-    Ok(Self::new(name, Box::new(CharDecodeReader::new(name, r, encoding)?)))
-  }
-
-  pub fn for_bytes(name: &str, bytes: Vec<u8>, encoding: &str) -> Result<Self> {
-    Ok(Self::with_encoding(name, Box::new(Cursor::new(bytes)), encoding)?)
-  }
-
+pub trait MarkableCharReader: CharReader {
   /// Returns the current read position of this stream.
   ///
-  pub fn location(&self) -> &Location {
-    &self.location
+  fn location(&self) -> Location;
+
+  fn is_eof(&mut self) -> Result<bool> {
+    let mark = self.mark()?;
+    let ch = self.read()?;
+    self.reset_to_mark(mark)?;
+    Ok(ch.is_none())
   }
 
   /// Determines whether the current read position of this stream is a forward match to the
   /// specified character sequence.
   ///
-  /// ```
-  /// use std::io::Cursor;
-  /// use ebnf::io::{CharReader, CharDecodeReader, SyntaxReader};
+  /// ```rust
+  /// use ebnf::io::{CharReader, MarkableCharReader, MarkableReader};
   ///
-  /// let mut r = SyntaxReader::for_bytes("", b"hello, world".to_vec(), "utf-8").unwrap();
+  /// let mut r = MarkableReader::for_bytes("", b"hello, world".to_vec(), "utf-8").unwrap();
   /// assert_eq!('h', r.read().unwrap().unwrap());
   /// assert!(r.prefix_matches(&['e', 'l', 'l']).unwrap());
   /// ```
   ///
-  pub fn prefix_matches(&mut self, prefix: &[char]) -> Result<bool> {
+  fn prefix_matches(&mut self, prefix: &[char]) -> Result<bool> {
     let mark = self.mark()?;
     for i in 0..prefix.len() {
       let ch = self.read()?;
@@ -154,16 +130,15 @@ impl MarkableReader {
   /// If the number of characters remaining in the stream is less than `length`, it will return the
   /// number of characters shorter than `length` up to EOF.
   ///
-  /// ```
-  /// use std::io::Cursor;
-  /// use ebnf::io::{CharReader, CharDecodeReader, SyntaxReader};
+  /// ```rust
+  /// use ebnf::io::{CharReader, MarkableCharReader, MarkableReader};
   ///
-  /// let mut r = SyntaxReader::for_bytes("", b"hello, world".to_vec(), "utf-8").unwrap();
+  /// let mut r = MarkableReader::for_bytes("", b"hello, world".to_vec(), "utf-8").unwrap();
   /// assert_eq!('h', r.read().unwrap().unwrap());
   /// assert_eq!("ell", r.peek(3).unwrap());
   /// ```
   ///
-  pub fn peek(&mut self, length: usize) -> Result<String> {
+  fn peek(&mut self, length: usize) -> Result<String> {
     let mark = self.mark()?;
     let mut chars = Vec::<char>::with_capacity(length);
     for _ in 0..length {
@@ -185,7 +160,7 @@ impl MarkableReader {
   /// The number of characters actually skipped; a value less than `length` may be returned if EOF
   /// is reached.
   ///
-  pub fn skip(&mut self, length: usize) -> Result<usize> {
+  fn skip(&mut self, length: usize) -> Result<usize> {
     let mut remainings = length;
     let mut buffer = ['\u{0}'; 1024];
     while remainings > 0 {
@@ -207,29 +182,14 @@ impl MarkableReader {
   /// # Returns
   /// Identifier of the marked position.
   ///
-  pub fn mark(&mut self) -> Result<usize> {
-    let marker = self.mark_index.acquire(&self.location)?;
-    self.mark_stack.push((marker, self.location.clone(), Vec::new()));
-    Ok(marker)
-  }
+  fn mark(&mut self) -> Result<u64>;
 
-  /// Resets the read position to the read position of the specified mark.
+  /// Resets the read position to the position of the specified mark.
   ///
   /// # Returns
   /// The number of characters that were undone by the reset operation.
   ///
-  pub fn reset_to_mark(&mut self, marker: usize) -> Result<usize> {
-    let i = self.find_mark_index(marker)?;
-    let mut undo_length = 0;
-    while self.mark_stack.len() > i {
-      let (_, location, unread) = self.mark_stack.pop().unwrap();
-      undo_length += unread.len();
-      self.lookahead_buffer.splice(0..0, unread);
-      self.location = location;
-    }
-    self.mark_index.release(marker);
-    Ok(undo_length)
-  }
+  fn reset_to_mark(&mut self, marker: u64) -> Result<usize>;
 
   /// Clears the read position of the specified mark. However, as long as the other marks remain,
   /// the internal buffer for resetting will remain.
@@ -237,71 +197,175 @@ impl MarkableReader {
   /// # Returns
   /// The number of characters that were undone by the clear operation.
   ///
-  pub fn clear_to_mark(&mut self, marker: usize) -> Result<usize> {
-    let i = self.find_mark_index(marker)?;
-    let mut clear_length = 0;
-    if i == 0 {
-      for j in 0..self.mark_stack.len() {
-        clear_length += self.mark_stack[j].2.len();
-      }
-      self.mark_stack.clear();
-      debug_assert_eq!(1, self.mark_index.len());
-    } else {
-      while self.mark_stack.len() > i {
-        let mut removal = self.mark_stack.remove(i);
-        clear_length += removal.2.len();
-        self.mark_stack[i - 1].2.append(&mut removal.2);
-      }
-    }
-    self.mark_index.release(marker);
-    Ok(clear_length)
-  }
+  fn unmark(&mut self, marker: u64) -> Result<()>;
+}
 
-  /// Save read characters only if markers are present.
-  fn save_undo_for_mark(&mut self, buffer: &[char], len: usize) -> Result<()> {
-    if !self.mark_stack.is_empty() {
-      let stack_len = self.mark_stack.len();
-      let last = &mut self.mark_stack[stack_len - 1];
-      last.2.append(&mut buffer[0..len].to_vec());
+// TODO テストして MarkableReader に追加し、また文字列版 MarkableCharReader を実装する。
+#[allow(dead_code)]
+struct UnreadBuffer {
+  location: Location,
+  buffer: Vec<char>,
+  /// Next read position in the buffer.
+  next_read_position_in_buffer: usize,
+  /// Position of the head of the buffer in the stream.
+  buffer_head_position_in_stream: u64,
+  // TODO: Introduce the upper limit of the buffer size for marks.
+  stack: Vec<(u64, Location)>,
+}
+
+#[allow(dead_code)]
+impl UnreadBuffer {
+  pub fn new(location: Location) -> Self {
+    UnreadBuffer {
+      location: location.clone(),
+      buffer: Vec::with_capacity(1024),
+      next_read_position_in_buffer: 0,
+      buffer_head_position_in_stream: 0,
+      stack: Vec::with_capacity(64),
     }
+  }
+  pub fn location(&self) -> Location {
+    self.location.clone()
+  }
+  pub fn remains(&self) -> bool {
+    self.buffer.len() > self.next_read_position_in_buffer
+  }
+  pub fn read(&mut self, buffer: &mut [char]) -> usize {
+    let length = std::cmp::min(buffer.len(), self.buffer.len() - self.next_read_position_in_buffer);
+    for i in 0..length {
+      buffer[i] = self.buffer[self.next_read_position_in_buffer + i];
+    }
+    self.next_read_position_in_buffer += length;
+    if !self.remains() {
+      self.truncate_buffer_if_stack_empty();
+    }
+    self.location.push_chars(&buffer[..length]);
+    length
+  }
+  pub fn append(&mut self, buf: &[char]) {
+    if !self.stack.is_empty() {
+      debug_assert!(!self.remains());
+      self.buffer.append(&mut buf.to_vec());
+      self.next_read_position_in_buffer += buf.len();
+    } else {
+      debug_assert!(self.buffer.is_empty());
+      debug_assert_eq!(0, self.next_read_position_in_buffer);
+      self.buffer_head_position_in_stream += buf.len() as u64;
+    }
+    self.location.push_chars(buf);
+  }
+  pub fn mark(&mut self) -> u64 {
+    let position = self.buffer_head_position_in_stream + self.next_read_position_in_buffer as u64;
+    debug_assert!(self.stack.last().map(|prev| prev.0 <= position).unwrap_or(true));
+    self.stack.push((position, self.location()));
+    position
+  }
+  pub fn revert(&mut self, mark: u64) -> Result<usize> {
+    self.location = self.remove_mark(mark)?;
+    let old_position = self.buffer_head_position_in_stream + self.next_read_position_in_buffer as u64;
+    self.next_read_position_in_buffer = (mark - self.buffer_head_position_in_stream) as usize;
+    Ok((old_position - mark) as usize)
+  }
+  pub fn unmark(&mut self, position: u64) -> Result<()> {
+    self.remove_mark(position)?;
+    self.truncate_buffer_if_stack_empty();
     Ok(())
   }
-
-  fn find_mark_index(&self, marker: usize) -> Result<usize> {
-    for i in 0..self.mark_stack.len() {
-      if self.mark_stack[i].0 == marker {
-        return Ok(i);
+  fn remove_mark(&mut self, mark: u64) -> Result<Location> {
+    if mark < self.buffer_head_position_in_stream
+      || mark > self.buffer_head_position_in_stream + self.buffer.len() as u64
+    {
+      return self.err_invalid_mark(mark);
+    }
+    for i in (0..self.stack.len()).rev() {
+      if self.stack[i].0 == mark {
+        let location = self.stack[i].1.clone();
+        self.stack.drain(i..);
+        return Ok(location);
+      } else if self.stack[i].0 < mark {
+        return self.err_invalid_mark(mark);
       }
     }
+    self.err_invalid_mark(mark)
+  }
+  fn truncate_buffer_if_stack_empty(&mut self) {
+    if self.stack.is_empty() {
+      self.buffer.truncate(0);
+      self.next_read_position_in_buffer = 0;
+    }
+  }
+  fn err_invalid_mark<T>(&self, mark: u64) -> Result<T> {
     Err(Error::new(
       &self.location,
-      format!("The specified mark is invalid: {}", marker),
+      format!("The specified mark {} is invalid: {:?}", mark, self.stack),
     ))
+  }
+}
+
+/// A character stream that implements mark, reset, and skip of the read position.
+///
+pub struct MarkableReader {
+  r: Box<dyn CharReader>,
+  buffer: UnreadBuffer,
+}
+
+impl MarkableReader {
+  pub fn new(name: &str, r: Box<dyn CharReader>) -> Self {
+    MarkableReader {
+      r,
+      buffer: UnreadBuffer::new(Location::new(name)),
+    }
+  }
+
+  pub fn with_location(location: Location, r: Box<dyn CharReader>) -> Self {
+    Self {
+      r,
+      buffer: UnreadBuffer::new(location),
+    }
+  }
+
+  pub fn with_encoding(name: &str, r: Box<dyn Read>, encoding: &str) -> Result<Self> {
+    Ok(Self::new(name, Box::new(CharDecodeReader::new(name, r, encoding)?)))
+  }
+
+  pub fn for_bytes(name: &str, bytes: Vec<u8>, encoding: &str) -> Result<Self> {
+    Ok(Self::with_encoding(name, Box::new(Cursor::new(bytes)), encoding)?)
   }
 }
 
 impl CharReader for MarkableReader {
   fn read_chars(&mut self, buffer: &mut [char]) -> Result<usize> {
-    if !self.lookahead_buffer.is_empty() {
-      let len = std::cmp::min(buffer.len(), self.lookahead_buffer.len());
-      for i in 0..len {
-        buffer[i] = self.lookahead_buffer[i];
-        self.location.push(buffer[i]);
-      }
-      self.lookahead_buffer.drain(0..len);
-      self.save_undo_for_mark(buffer, len)?;
-      return Ok(len);
+    if self.buffer.remains() {
+      let length = self.buffer.read(buffer);
+      return Ok(length);
     }
 
     match self.r.read_chars(buffer) {
       Ok(len) if len == 0 => Ok(0),
       Ok(len) => {
-        self.location.push_chars(&buffer[0..len]);
-        self.save_undo_for_mark(buffer, len)?;
+        self.buffer.append(&buffer[..len]);
         Ok(len)
       }
-      Err(err) => Err(Error::new(&self.location, format!("{}", err))),
+      Err(err) => Err(Error::new(&self.buffer.location(), format!("{}", err))),
     }
+  }
+}
+
+impl MarkableCharReader for MarkableReader {
+  fn location(&self) -> Location {
+    self.buffer.location()
+  }
+
+  fn mark(&mut self) -> Result<u64> {
+    Ok(self.buffer.mark())
+  }
+
+  fn reset_to_mark(&mut self, marker: u64) -> Result<usize> {
+    self.buffer.revert(marker)
+  }
+
+  fn unmark(&mut self, marker: u64) -> Result<()> {
+    self.buffer.remove_mark(marker).map(|_| ())
   }
 }
 
@@ -535,36 +599,5 @@ impl Decoder {
         self.encoding, from.lines, from.columns, to.lines, to.columns
       ),
     ));
-  }
-}
-
-struct Index {
-  next: usize,
-  in_use: HashSet<usize>,
-}
-
-impl Index {
-  pub fn new() -> Self {
-    Index {
-      next: 0,
-      in_use: HashSet::with_capacity(32),
-    }
-  }
-  pub fn acquire(&mut self, location: &Location) -> Result<usize> {
-    if self.in_use.len() == usize::MAX {
-      return Err(Error::new(location, "Too many mark operations."));
-    }
-    let mut i = self.next;
-    while self.in_use.contains(&i) {
-      i = if i == usize::MAX { 0 } else { i + 1 };
-    }
-    self.next = i + 1;
-    Ok(i)
-  }
-  pub fn release(&mut self, i: usize) {
-    self.in_use.remove(&i);
-  }
-  pub fn len(&self) -> usize {
-    self.in_use.len()
   }
 }

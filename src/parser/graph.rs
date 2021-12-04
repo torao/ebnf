@@ -1,10 +1,11 @@
 use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
+  io::MarkableCharReader,
   keyed_meta_identifier,
   lex::{DefinitionList, SingleDefinition, SyntacticFactor, SyntacticPrimary, SyntacticTerm},
   parser::{machine::TerminalStringScanner, parallel_notation, Event, SpecialSequenceParser},
-  Location, Result, Syntax,
+  Error, Location, Result, Syntax,
 };
 
 use super::{
@@ -12,7 +13,6 @@ use super::{
   LexMachine,
 };
 
-#[derive(Debug)]
 pub struct Instruction {
   pub next: Option<usize>,
   pub symbol: String,
@@ -24,22 +24,16 @@ pub trait Scanner {
   fn scan(
     &self,
     context: &mut LexMachine,
-    instr: &Instruction,
-    location: &Location,
-    buffer: &[char],
-    flush: bool,
+    address: usize,
+    r: &mut dyn MarkableCharReader,
+    events: &mut Vec<Event>,
   ) -> Result<Prospect>;
 }
 
 #[derive(Debug)]
 pub enum Prospect {
-  WaitingForMore,
-  NextStep {
-    length: usize,
-    event: Option<Event>,
-    next: Option<usize>,
-  },
-  NotThisWay,
+  Proceed,
+  NotThisWay(Error),
 }
 
 pub enum Step {
@@ -51,36 +45,13 @@ pub enum Step {
   Or {
     subroutines: Vec<usize>,
   },
-  Step {
+  Scan {
     location: Location,
     scanner: Box<dyn Scanner>,
   },
   Alias {
     meta_identifier: String,
   },
-}
-
-impl Debug for Step {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::Repetition { min, max, subroutine } => f
-        .debug_struct("Repetition")
-        .field("min", min)
-        .field("max", max)
-        .field("subroutine", subroutine)
-        .finish(),
-      Self::Or { subroutines } => f.debug_struct("Or").field("subroutines", subroutines).finish(),
-      Self::Step { location, .. } => f
-        .debug_struct("Step")
-        .field("location", location)
-        .field("scanner", &"***")
-        .finish(),
-      Self::Alias { meta_identifier } => f
-        .debug_struct("Alias")
-        .field("meta_identifier", meta_identifier)
-        .finish(),
-    }
-  }
 }
 
 pub struct LexGraph {
@@ -196,7 +167,7 @@ fn register_syntactic_term(
       next,
       symbol: term.to_string(),
       definition: term.syntactic_factor.syntactic_primary.location().clone(),
-      step: Step::Step {
+      step: Step::Scan {
         location: Location::with_location(file!(), line!() as u64, column!() as u64),
         scanner: Box::new(TermWithExceptionScanner::new(factor, exception)),
       },
@@ -275,7 +246,7 @@ fn register_syntactic_primary(
       symbol = format!("{:?}", terminal_string);
       let terminal_string = terminal_string.chars().collect::<Vec<_>>();
       (
-        Step::Step {
+        Step::Scan {
           location: Location::with_location(file!(), line!() as u64, column!() as u64),
           scanner: Box::new(TerminalStringScanner::new(terminal_string)),
         },
@@ -286,7 +257,7 @@ fn register_syntactic_primary(
       let scanner = (config.special_sequence_parser.0)(definition, special_sequence);
       symbol = scanner.symbol();
       (
-        Step::Step {
+        Step::Scan {
           location: Location::with_location(file!(), line!() as u64, column!() as u64),
           scanner: Box::new(SpecialSequenceScanner::new(scanner)),
         },
@@ -296,7 +267,7 @@ fn register_syntactic_primary(
     SyntacticPrimary::EmptySequence(definition) => {
       symbol = String::from("EMPTY");
       (
-        Step::Step {
+        Step::Scan {
           location: Location::with_location(file!(), line!() as u64, column!() as u64),
           scanner: Box::new(EmptyScanner::new()),
         },
